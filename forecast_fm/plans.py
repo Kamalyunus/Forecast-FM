@@ -22,11 +22,10 @@ import numpy as np
 import pandas as pd
 
 from .config import ProjectConfig
-from .data import SERIES, TS, categorical_cols, make_series_id, read_table
+from .data import SERIES, TS, apply_derived, categorical_cols, make_series_id, read_table
 
 AS_OF = "as_of"
 HORIZON = "horizon"
-MIN_PLAN_COVERAGE = 0.99
 
 
 def load_plans(project: ProjectConfig) -> pd.DataFrame | None:
@@ -35,13 +34,16 @@ def load_plans(project: ProjectConfig) -> pd.DataFrame | None:
     as_of+horizon."""
     if not project.planned_covariates_path:
         return None
-    df = read_table(project.planned_covariates_path)
-    need = [AS_OF, project.timestamp_col, *project.series_id_cols]
+    df = read_table(project.planned_covariates_path).rename(columns=project.plan_columns)
+    df = apply_derived(df, project, strict=False)
+    ts_col = project.plan_timestamp_col or project.timestamp_col
+    need = [project.plan_as_of_col, ts_col, *project.series_id_cols]
     missing = [c for c in need if c not in df.columns]
     if missing:
-        raise ValueError(f"plan snapshots missing columns {missing}")
+        raise ValueError(f"plan snapshots missing columns {missing} (see plan_as_of_col, "
+                         "plan_timestamp_col, plan_columns)")
     df[SERIES] = make_series_id(df, project.series_id_cols)
-    df = df.rename(columns={project.timestamp_col: TS})
+    df = df.rename(columns={ts_col: TS, project.plan_as_of_col: AS_OF})
     df[TS] = pd.to_datetime(df[TS]).dt.normalize()
     df[AS_OF] = pd.to_datetime(df[AS_OF]).dt.normalize()
     keep = [c for c in project.known_covariate_cols if c in df.columns]
@@ -120,9 +122,15 @@ def future_frame(history: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectCo
             print(f"[plan] cutoff {cutoff.date()}: snapshot as_of "
                   f"{as_of.date() if as_of is not None else 'NONE'}; coverage "
                   + ", ".join(f"{c}={v:.1%}" for c, v in coverage.items()))
-        low = {c: v for c, v in coverage.items() if v < MIN_PLAN_COVERAGE}
+        if as_of is not None and project.plan_max_age_days is not None:
+            age = (cutoff - as_of).days
+            if age > project.plan_max_age_days:
+                warnings.warn(f"latest plan snapshot for cutoff {cutoff.date()} is {age} days old "
+                              f"(as_of {as_of.date()}; plan_max_age_days={project.plan_max_age_days})",
+                              stacklevel=2)
+        low = {c: v for c, v in coverage.items() if v < project.min_plan_coverage}
         if low:
-            warnings.warn(f"plan coverage below {MIN_PLAN_COVERAGE:.0%} at cutoff {cutoff.date()}: "
+            warnings.warn(f"plan coverage below {project.min_plan_coverage:.0%} at cutoff {cutoff.date()}: "
                           + ", ".join(f"{c}={v:.1%}" for c, v in low.items())
                           + " (missing values are passed as NaN)", stacklevel=2)
 

@@ -42,28 +42,29 @@ from .models.chronos2 import CKPT, MANIFEST, Chronos2, history_hash
 FORMAT_VERSION = 1
 
 
-def default_out(exp: ExperimentConfig, as_of: pd.Timestamp) -> Path:
+def default_out(project: ProjectConfig, exp: ExperimentConfig, as_of: pd.Timestamp) -> Path:
     slug = re.sub(r"[^a-z0-9]+", "-", exp.name.lower()).strip("-")
-    return Path("models") / f"{slug}-{as_of:%Y%m%d}"
+    return Path(project.models_dir) / f"{slug}-{as_of:%Y%m%d}"
 
 
 def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame,
              as_of: str | pd.Timestamp | None = None, out: str | Path | None = None,
              force: bool = False, config_path: str | Path | None = None) -> Path:
-    if exp.model != "chronos2" or not exp.model_params.get("fine_tune"):
+    if exp.model != "chronos2" or not project.model_params(exp.model, exp.model_params).get("fine_tune"):
         raise ValueError("finetune needs a chronos2 config with a `fine_tune:` block "
                          "(e.g. configs/05_chronos2_lora.yaml)")
     last = panel[TS].max()
     as_of = last if as_of is None else pd.Timestamp(as_of)
     if as_of > last:
         raise ValueError(f"--as-of {as_of.date()} is after the last date in the data ({last.date()})")
-    out = Path(out) if out else default_out(exp, as_of)
+    out = Path(out) if out else default_out(project, exp, as_of)
     if out.exists() and not force:
         raise FileExistsError(f"{out} exists; checkpoints are not overwritten (pass --force, "
                               "or choose another --out)")
 
     history = panel[panel[TS] <= as_of]
-    model = Chronos2(exp.model_params)
+    params = project.model_params(exp.model, exp.model_params)
+    model = Chronos2(params)
     known, past = model._covariates(history, project)
     model._load(as_of)
 
@@ -75,7 +76,6 @@ def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame,
           f"{history[TS].min().date()} .. {as_of.date()}, on {model.device} ({model.dtype})")
     facts = model.train(history, project, stage)
 
-    params = dict(exp.model_params)
     base_id = str(params.get("model_id", "amazon/chronos-2"))
     manifest = {
         "format_version": FORMAT_VERSION,

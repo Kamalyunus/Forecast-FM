@@ -80,7 +80,7 @@ def record(exp: ExperimentConfig, project: ProjectConfig, result: dict, commit: 
     else:
         state = code_state()
         exp_id = "scratch"
-        out = Path("reports/scratch") / re.sub(r"[^a-z0-9]+", "-", exp.name.lower())
+        out = Path(project.reports_dir) / "scratch" / re.sub(r"[^a-z0-9]+", "-", exp.name.lower())
     out.mkdir(parents=True, exist_ok=True)
 
     ref = load_metrics(exp.based_on) if exp.based_on else None

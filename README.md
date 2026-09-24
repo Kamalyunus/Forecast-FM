@@ -38,6 +38,34 @@ Mac notes:
   easily in 32 GB. All 700k series x 4 years (~1B rows) do not fit as one
   panel, so the full run is sharded by series (see `docs/SPEC.md`, WP4).
 
+## Configuring `project.yaml`
+
+Every option is documented in `project.yaml`. Beyond the columns and covariate classes:
+
+| need | option |
+|---|---|
+| several files / a glob / a parquet folder | `data_path: [a.parquet, "parts/*.csv"]` |
+| compute a column (`1 - price/regular_price`) | `derived_columns` (also applied to plan files) |
+| keep a subset (channel, country, date window) | `row_filter`, `start_date`, `end_date`, `min_history_days` |
+| repeated (series, date) rows | `duplicates: sum \| mean \| max \| first \| last` |
+| returns / missing days | `negative_target`, `missing_target` |
+| stockouts from stock levels | `stockout_expr: "stock_on_hand <= 0"` |
+| plan files with other column names | `plan_as_of_col`, `plan_timestamp_col`, `plan_columns` |
+| stale or incomplete plans | `plan_max_age_days`, `min_plan_coverage` |
+| fixed backtest dates | `cutoffs`, `holdout_cutoffs` |
+| decision quantile | `service_level` |
+| metrics by category / brand | `slice_cols` |
+| machine settings for every experiment | `model_defaults: {chronos2: {device: mps}}` |
+| output locations | `reports_dir`, `models_dir` |
+
+Layering: `extends: base.yaml`, named `profiles:` (`--profile full`), command-line
+overrides (`--set horizon=35 --set covariate_eval_policy.price=carry_forward`) and
+`${ENV_VAR:-default}` in any string. Check the result with:
+
+```bash
+python -m forecast_fm --profile full config --check-data
+```
+
 ## Workflow
 
 ```bash

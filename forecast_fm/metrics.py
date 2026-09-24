@@ -25,7 +25,8 @@ def _quantiles(preds: pd.DataFrame) -> list[float]:
     return sorted(float(c[len(Q_PREFIX):]) for c in preds.columns if c.startswith(Q_PREFIX))
 
 
-def prepare(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | None = None) -> pd.DataFrame:
+def prepare(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | None = None,
+            statics: pd.DataFrame | None = None) -> pd.DataFrame:
     p = preds[preds["y_true"].notna() & ~preds[STOCKOUT].fillna(False).astype(bool)].copy()
     y, f = p["y_true"].to_numpy(np.float64), p["y_pred"].to_numpy(np.float64)
     p["_y"], p["_ae"], p["_e"] = y, np.abs(f - y), f - y
@@ -36,6 +37,9 @@ def prepare(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | No
     p["bucket"] = bucket_labels(p[HORIZON], project.horizon_buckets)
     if classes is not None:
         p["demand_class"] = p[SERIES].map(classes).astype(str)
+    if statics is not None:
+        for c in project.slice_cols:
+            p[c] = p[SERIES].map(statics[c]).astype(str)
     return p
 
 
@@ -67,13 +71,19 @@ def summarize(p: pd.DataFrame, by: list[str] | None = None) -> pd.DataFrame:
     return out.reset_index() if by else out.reset_index(drop=True)
 
 
-def score(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | None = None) -> dict:
-    p = prepare(preds, project, classes)
+def score(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | None = None,
+          statics: pd.DataFrame | None = None) -> dict:
+    """`statics`: one row per series (index series_id) with the slice_cols."""
+    p = prepare(preds, project, classes, statics)
     overall = summarize(p).iloc[0].to_dict()
     tables = {"fold": summarize(p, ["fold"]), "bucket": summarize(p, ["bucket"])}
     if classes is not None:
         tables["demand_class"] = summarize(p, ["demand_class"])
         tables["bucket_x_class"] = summarize(p, ["bucket", "demand_class"])
+    if statics is not None:
+        for c in project.slice_cols:
+            if c != "demand_class":
+                tables[c] = summarize(p, [c])
     return {"overall": _clean(overall), "tables": tables}
 
 

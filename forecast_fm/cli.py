@@ -12,7 +12,22 @@ import pandas as pd
 def _project(args):
     from .config import load_project
 
-    return load_project(args.project)
+    return load_project(args.project, profile=args.profile, overrides=args.set)
+
+
+def cmd_config(args):
+    """Print the fully resolved project config (extends, sections, profile,
+    --set and ${ENV} applied) and optionally check it against the data."""
+    import yaml
+
+    project = _project(args)
+    print(yaml.safe_dump(project.to_dict(), sort_keys=False))
+    if args.check_data:
+        from .data import load_raw
+
+        raw = load_raw(project, args.data)
+        print(f"[config] OK: {len(raw):,} rows, {raw['series_id'].nunique():,} series, "
+              f"{raw['ts'].min().date()} .. {raw['ts'].max().date()}; all declared columns present")
 
 
 def cmd_env(args):
@@ -35,8 +50,9 @@ def cmd_audit(args):
     project = _project(args)
     raw = load_raw(project, args.data)
     panel = build_panel(raw, project)
-    print(audit(panel, len(raw), project, args.out))
-    print(f"[audit] -> {args.out}")
+    out = args.out or f"{project.reports_dir}/data_audit.md"
+    print(audit(panel, len(raw), project, out))
+    print(f"[audit] -> {out}")
 
 
 def cmd_sample(args):
@@ -61,7 +77,7 @@ def cmd_cutoffs(args):
 
 def _run_backtest(project, exp, data=None):
     from .backtest import backtest
-    from .data import TS, demand_classes, load_panel
+    from .data import SERIES, TS, demand_classes, load_panel
     from .device import describe
     from .folds import fold_cutoffs
     from .metrics import score
@@ -72,7 +88,10 @@ def _run_backtest(project, exp, data=None):
     preds, stats = backtest(panel, project, exp, plans)
     first_cutoff = fold_cutoffs(panel[TS].min(), panel[TS].max(), project)[0]
     classes = demand_classes(panel, project, end=first_cutoff)
-    result = score(preds, project, classes)
+    statics = None
+    if project.slice_cols:
+        statics = panel.drop_duplicates(SERIES).set_index(SERIES)[project.slice_cols]
+    result = score(preds, project, classes, statics)
     result.update(stats=stats, env=describe())
     return preds, result
 
@@ -122,9 +141,10 @@ def cmd_forecast(args):
     cutoff = panel[TS].max()
     out, stats = forecast_at(panel, cutoff, project, exp, load_plans(project), production=True)
     out.insert(0, "cutoff", cutoff)
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(args.out, index=False)
-    print(f"[forecast] origin {cutoff.date()}: {out['series_id'].nunique():,} series -> {args.out}")
+    dest = args.out or f"{project.reports_dir}/forecast_{cutoff:%Y%m%d}.parquet"
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(dest, index=False)
+    print(f"[forecast] origin {cutoff.date()}: {out['series_id'].nunique():,} series -> {dest}")
     if stats:
         print(json.dumps(stats, default=str))
 
@@ -132,14 +152,24 @@ def cmd_forecast(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="forecast_fm", description=__doc__)
     ap.add_argument("-p", "--project", default="project.yaml")
+    ap.add_argument("--profile", help="apply a named profile from project.yaml "
+                                      "(default: $FORECAST_FM_PROFILE)")
+    ap.add_argument("-s", "--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override a project setting, e.g. --set horizon=35 "
+                         "--set covariate_eval_policy.price=carry_forward (repeatable)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("env", help="torch / device / chronos versions").set_defaults(fn=cmd_env)
     sub.add_parser("models", help="registered model families").set_defaults(fn=cmd_models)
 
+    k = sub.add_parser("config", help="print the resolved project config")
+    k.add_argument("--check-data", action="store_true", help="also load the data and check columns")
+    k.add_argument("--data")
+    k.set_defaults(fn=cmd_config)
+
     a = sub.add_parser("audit", help="data audit -> reports/data_audit.md")
     a.add_argument("--data")
-    a.add_argument("--out", default="reports/data_audit.md")
+    a.add_argument("--out", help="default: <reports_dir>/data_audit.md")
     a.set_defaults(fn=cmd_audit)
 
     s = sub.add_parser("sample", help="stratified series sample (before ETL)")
@@ -177,7 +207,7 @@ def main(argv=None):
     f = sub.add_parser("forecast", help="production forecast from the last date")
     f.add_argument("config")
     f.add_argument("--data")
-    f.add_argument("--out", default="reports/forecast.parquet")
+    f.add_argument("--out", help="default: <reports_dir>/forecast_<origin>.parquet")
     f.set_defaults(fn=cmd_forecast)
 
     args = ap.parse_args(argv)

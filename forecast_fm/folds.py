@@ -9,7 +9,8 @@ from .config import ProjectConfig
 
 def fold_cutoffs(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig,
                  holdout: bool = False) -> list[pd.Timestamp]:
-    """Validation cutoffs, ascending. With `holdout=True`, the
+    """Validation cutoffs, ascending. Explicit `cutoffs` / `holdout_cutoffs`
+    in project.yaml win over the rule below. With `holdout=True`, the
     `holdout_folds` most recent cutoffs instead: the test set that only
     promotion evaluates.
 
@@ -20,6 +21,18 @@ def fold_cutoffs(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig
     folds, not 1.
     """
     last, first = pd.Timestamp(last), pd.Timestamp(first)
+    explicit = project.holdout_cutoffs if holdout else project.cutoffs
+    if explicit:
+        cutoffs = sorted(pd.Timestamp(c) for c in explicit)
+        late = [c for c in cutoffs if c + pd.Timedelta(days=project.horizon) > last]
+        if late:
+            raise ValueError(f"cutoffs {[str(c.date()) for c in late]}: horizon runs past the "
+                             f"last date {last.date()}")
+        if not holdout and project.holdout_cutoffs:
+            first_hold = min(pd.Timestamp(c) for c in project.holdout_cutoffs)
+            if max(cutoffs) + pd.Timedelta(days=project.horizon) > first_hold:
+                raise ValueError("validation cutoffs' horizons overlap the first holdout cutoff")
+        return cutoffs
     if holdout:
         idx = range(project.holdout_folds)
     else:

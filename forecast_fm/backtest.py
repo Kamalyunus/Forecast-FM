@@ -45,7 +45,7 @@ def forecast_at(panel: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectConfi
         window = panel[(panel[TS] > cutoff) & (panel[TS] <= cutoff + pd.Timedelta(days=project.horizon))]
         actuals = window[[SERIES, TS, *known]]  # declared-known columns only
     future = future_frame(history, cutoff, project, plans, actuals=actuals, production=production)
-    model = create_model(exp.model, exp.model_params)
+    model = create_model(exp.model, project.model_params(exp.model, exp.model_params))
     model.fit(history, project, cutoff)
     point, qd = model.predict(history, future, project)
     out = future[[SERIES, TS, HORIZON]].copy()

@@ -33,13 +33,47 @@ def make_series_id(df: pd.DataFrame, id_cols: list[str]) -> pd.Series:
     return out
 
 
-def read_table(path: str | Path, columns: list[str] | None = None) -> pd.DataFrame:
-    path = Path(path)
+def _expand(path: str | Path | list) -> list[Path]:
+    """A path, a directory, a glob pattern, or a list of those -> files/dirs."""
+    items = path if isinstance(path, (list, tuple)) else [path]
+    out: list[Path] = []
+    for item in items:
+        item = str(item)
+        if any(ch in item for ch in "*?["):
+            matches = sorted(Path().glob(item)) if not Path(item).is_absolute() else \
+                sorted(Path("/").glob(item.lstrip("/")))
+            if not matches:
+                raise FileNotFoundError(f"no files match {item!r}")
+            out.extend(matches)
+        else:
+            out.append(Path(item))
+    return out
+
+
+def _read_one(path: Path, columns: list[str] | None) -> pd.DataFrame:
     if path.suffix in (".parquet", ".pq") or path.is_dir():
         return pd.read_parquet(path, columns=columns)
-    if path.suffix == ".csv":
+    if path.suffix in (".csv", ".gz", ".bz2", ".zip") or path.name.endswith((".csv.gz", ".csv.zip")):
         return pd.read_csv(path, usecols=columns)
     raise ValueError(f"unsupported data file {path} (csv or parquet)")
+
+
+def read_table(path: str | Path | list, columns: list[str] | None = None) -> pd.DataFrame:
+    parts = [_read_one(p, columns) for p in _expand(path)]
+    return parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+
+
+def apply_derived(df: pd.DataFrame, project: ProjectConfig, strict: bool = True) -> pd.DataFrame:
+    """Add `derived_columns` (pandas expressions) in order. With strict=False,
+    an expression whose inputs are absent is skipped (plan files carry only
+    some columns)."""
+    for name, expr in project.derived_columns.items():
+        try:
+            df[name] = df.eval(expr)
+        except Exception as e:  # pandas raises several types for bad names
+            if strict:
+                raise ValueError(f"derived_columns[{name}] = {expr!r} failed: {e}") from e
+    return df
 
 
 def categorical_cols(project: ProjectConfig, df: pd.DataFrame) -> list[str]:
@@ -56,21 +90,71 @@ def categorical_cols(project: ProjectConfig, df: pd.DataFrame) -> list[str]:
     return out
 
 
-def load_raw(project: ProjectConfig, path: str | Path | None = None) -> pd.DataFrame:
+def load_raw(project: ProjectConfig, path: str | Path | list | None = None) -> pd.DataFrame:
     path = path or project.data_path
     return prepare_raw(read_table(path), project, source=str(path))
 
 
 def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data") -> pd.DataFrame:
-    """User column names -> canonical raw frame (series_id, ts, y, ...)."""
+    """User data -> canonical raw frame (series_id, ts, y, stockout, ...):
+    derived columns, row filter, date window, stockout rule, negative-target
+    rule, and duplicate aggregation, in that order."""
+    df = apply_derived(df.copy(), project)
+    if project.row_filter:
+        df = df.query(project.row_filter)
+    if project.stockout_expr:
+        try:
+            stock = df.eval(project.stockout_expr)
+        except Exception as e:
+            raise ValueError(f"stockout_expr {project.stockout_expr!r} failed: {e}") from e
+        stock = pd.Series(stock, index=df.index).fillna(False).astype(bool)
     missing = [c for c in project.raw_columns if c not in df.columns]
     if missing:
         raise ValueError(f"{source}: columns declared in project.yaml are missing: {missing}")
-    df = df[project.raw_columns].copy()
-    df[SERIES] = make_series_id(df, project.series_id_cols)
-    df = df.rename(columns={project.timestamp_col: TS, project.target_col: Y})
-    df[TS] = pd.to_datetime(df[TS]).dt.normalize()
-    return df
+    out = df[project.raw_columns].copy()
+    if project.stockout_expr:
+        out[STOCKOUT] = stock.to_numpy()
+    elif project.in_stock_col:
+        v = pd.to_numeric(out[project.in_stock_col], errors="coerce")
+        out[STOCKOUT] = (v == 0).to_numpy()  # NaN (unknown) counts as in stock
+    else:
+        out[STOCKOUT] = False
+    out[SERIES] = make_series_id(out, project.series_id_cols)
+    out = out.rename(columns={project.timestamp_col: TS, project.target_col: Y})
+    out[TS] = pd.to_datetime(out[TS]).dt.normalize()
+    if project.start_date:
+        out = out[out[TS] >= pd.Timestamp(project.start_date)]
+    if project.end_date:
+        out = out[out[TS] <= pd.Timestamp(project.end_date)]
+    if out.empty:
+        raise ValueError(f"{source}: no rows left after filters")
+
+    y = pd.to_numeric(out[Y], errors="coerce")
+    if (y < 0).any():
+        n = int((y < 0).sum())
+        if project.negative_target == "error":
+            raise ValueError(f"{source}: {n} negative targets (set negative_target: clip | nan | keep)")
+        if project.negative_target == "clip":
+            y = y.clip(lower=0)
+        elif project.negative_target == "nan":
+            y = y.where(y >= 0)
+    out[Y] = y
+    return _dedupe(out, project)
+
+
+def _dedupe(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
+    if project.duplicates == "error":
+        return raw
+    dup = raw.duplicated([SERIES, TS], keep=False)
+    if not dup.any():
+        return raw
+    agg = {c: "last" for c in raw.columns if c not in (SERIES, TS)}
+    agg[Y] = project.duplicates
+    agg[STOCKOUT] = "max"
+    merged = raw[dup].groupby([SERIES, TS], as_index=False, sort=False).agg(agg)
+    print(f"[data] {int(dup.sum()):,} duplicate (series, date) rows -> {len(merged):,} "
+          f"({project.duplicates} of the target)")
+    return pd.concat([raw[~dup], merged[raw.columns]], ignore_index=True)
 
 
 def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
@@ -82,12 +166,11 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     index arithmetic (offset of the series + days since its start), not by a
     merge.
     """
-    if project.freq != "D":
-        raise ValueError("only daily data (freq: D) is supported")
     if raw.duplicated([SERIES, TS]).any():
         n = int(raw.duplicated([SERIES, TS]).sum())
         raise ValueError(f"{n} duplicate (series, date) rows; check series_id_cols "
-                         f"{project.series_id_cols} match the data's grain")
+                         f"{project.series_id_cols} match the data's grain, or set "
+                         "duplicates: sum | mean | max | first | last")
 
     sid = raw[SERIES].astype("category")
     codes = sid.cat.codes.to_numpy()
@@ -115,14 +198,13 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
         TS: out_day.astype("datetime64[D]").astype("datetime64[ns]"),
     })
 
-    y = np.zeros(total, dtype=np.float32)
+    y = np.full(total, 0.0 if project.missing_target == "zero" else np.nan, dtype=np.float32)
     y[pos] = raw[Y].to_numpy(dtype=np.float32)
     panel[Y] = y
 
     stock = np.zeros(total, dtype=bool)
-    if project.in_stock_col:
-        v = pd.to_numeric(raw[project.in_stock_col], errors="coerce").to_numpy()
-        stock[pos] = v == 0  # NaN (unknown) counts as in stock
+    if STOCKOUT in raw.columns:
+        stock[pos] = raw[STOCKOUT].to_numpy(dtype=bool)
     panel[STOCKOUT] = stock
 
     cats = set(categorical_cols(project, raw))
@@ -152,9 +234,16 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
         for c in statics:
             panel[c] = pd.Categorical(first[c].astype(str).to_numpy()[out_codes])
 
-    got, want = float(panel[Y].to_numpy(np.float64).sum()), float(raw[Y].sum())
+    got, want = float(np.nansum(panel[Y].to_numpy(np.float64))), float(raw[Y].sum())
     if not np.isclose(got, want, rtol=1e-6, atol=1e-3):
         raise AssertionError(f"target mass changed building the grid: {want} -> {got}")
+
+    if project.min_history_days:
+        keep = lengths >= project.min_history_days
+        if not keep.all():
+            print(f"[data] dropping {int((~keep).sum()):,} series with < {project.min_history_days} days")
+            panel = panel[keep[out_codes]].reset_index(drop=True)
+            panel[SERIES] = panel[SERIES].cat.remove_unused_categories()
     return panel
 
 

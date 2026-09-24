@@ -26,7 +26,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 44 tests (36 run without torch; 8 need the tiny real Chronos-2).
+`pytest`: 58 tests (50 run without torch; 8 need the tiny real Chronos-2).
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
@@ -65,7 +65,15 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
   - Saves `models/<name>-<date>/` with `finetuned-ckpt/`, a `forecast_fm_model.json` manifest (base model, recipe and config hash, training window, data hash, code commit, env), and a ready `forecast_config.yaml`.
   - The output is staged in a `.partial` directory and never overwritten without `--force`.
   - The chronos2 model refuses a saved checkpoint at any cutoff before its `train_end`, checked before loading. Forecasts report the checkpoint's age in days.
-- ✅ **CLI**: `env, models, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
+- ✅ **Configurable `project.yaml`** (`config.py`):
+  - Loading: sections, `extends`, `profiles` (`--profile`, `$FORECAST_FM_PROFILE`), `--set` dotted overrides, `${ENV}` interpolation, did-you-mean errors, and all validation errors reported at once.
+  - Data: multi-file, glob and list inputs; `derived_columns`; `row_filter`; a date window; `min_history_days`; `duplicates`, `negative_target` and `missing_target` rules; `stockout_expr`.
+  - Plans: column mapping, `plan_max_age_days`, `min_plan_coverage`.
+  - Backtest and evaluation: explicit `cutoffs` / `holdout_cutoffs`, `service_level`, `slice_cols`.
+  - Models and paths: `model_defaults` per model family, `reports_dir`, `models_dir`.
+  - `python -m forecast_fm config [--check-data]` prints the resolved config.
+  - Not supported: frequencies other than daily (`freq: D`).
+- ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 
 ## 3. Invariants
