@@ -1,0 +1,15 @@
+name: chronos2-lora-continuous-only
+hypothesis: "Fine-tuning on continuous series only improves them without the intermittent class diluting training"
+mechanism: "The trainer samples series uniformly; excluding mostly-zero series keeps every training window informative for continuous demand"
+rationale: "Intermittent series are ~77% of the catalog; test A of the train-mix study"
+model: chronos2
+model_params:
+  fine_tune:
+    mode: lora
+    num_steps: 1000
+    learning_rate: 1.0e-5
+    batch_size: 64
+    train_mix:
+      classes: [BAU, seasonal, promo, event]   # TODO: your continuous labels
+      seed: 42
+based_on: exp002        # TODO: the ledgered zero-shot id

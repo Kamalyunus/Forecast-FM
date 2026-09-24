@@ -96,6 +96,27 @@ Existing checkpoints are never overwritten unless you pass `--force`. Retrain on
 schedule with a new `--as-of`. Each `forecast` reports the checkpoint's age
 in days.
 
+**Choosing the training series** (`fine_tune.train_mix`). The trainer draws
+series uniformly, so the class mix of the training set is the mix the model
+learns. When most of the catalog is intermittent, set the mix explicitly:
+
+```yaml
+fine_tune:
+  mode: lora
+  train_mix:
+    classes: [BAU, seasonal, promo, event, intermittent]  # may train (default: all)
+    max_share: {intermittent: 0.25}   # cap a class's share of the training series
+    min_nonzero_days: 4               # drop near-dead series ...
+    lookback_days: 365                # ... over the last year before the cutoff
+    max_series: 50000                 # cap the total, keeping the shares
+    seed: 42
+```
+
+Only training is affected: every series is still forecast and scored. The
+selection uses data up to each fold's cutoff only. The realized mix is recorded
+in the run stats and the `finetune` manifest. `configs/06a-c` are the
+continuous-only / natural-mix / capped-intermittent study.
+
 A saved checkpoint refuses to forecast from any date before its `train_end`,
 so it can never be backtested on data it has already seen. To measure a
 recipe's accuracy, use `run` with `fine_tune:` in the config.
@@ -121,6 +142,7 @@ python -m forecast_fm -p examples/demo_project.yaml run configs/03_chronos2_zero
 | `forecast_fm/metrics.py` | WAPE, bias, MASE, wQL, quantile coverage by fold / horizon bucket / demand class |
 | `forecast_fm/models/` | `naive`, `seasonal_naive`, `croston`, `chronos2` |
 | `forecast_fm/device.py` | CUDA / MPS / CPU and dtype selection |
+| `forecast_fm/train_mix.py` | which series a fine-tune trains on (class filter, share caps, activity) |
 | `forecast_fm/finetune.py` | production fine-tuning: a saved checkpoint + manifest + forecast config |
 | `forecast_fm/ledger.py` | append-only `experiments/`, verdicts vs `based_on` |
 | `configs/` | experiment configs (one hypothesis each) |

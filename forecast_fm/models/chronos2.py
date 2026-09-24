@@ -39,10 +39,13 @@ from ..config import ProjectConfig
 from ..data import SERIES, STOCKOUT, TS, Y, categorical_cols
 from ..device import empty_cache, peak_memory_mb, prepare, resolve_device, resolve_dtype
 from ..plans import HORIZON
+from ..train_mix import select as select_training_series
+from ..train_mix import validate as validate_mix
 from .base import Forecast, Forecaster
 
 DEFAULT_MODEL_ID = "amazon/chronos-2"
-FINE_TUNE_KEYS = frozenset({"num_steps", "learning_rate", "mode", "batch_size", "context_length"})
+FINE_TUNE_KEYS = frozenset({"num_steps", "learning_rate", "mode", "batch_size", "context_length",
+                            "train_mix"})
 
 # loaded base pipelines keyed by (model_id, device, dtype): the backtest
 # builds a fresh model per fold; reloading the weights each time is waste
@@ -154,6 +157,8 @@ class Chronos2(Forecaster):
                 raise ValueError(f"chronos2 fine_tune: unknown keys {sorted(bad)}")
             if ft.get("mode", "full") not in ("full", "lora"):
                 raise ValueError("chronos2 fine_tune.mode must be 'full' or 'lora'")
+            if ft.get("train_mix") is not None:
+                validate_mix(ft["train_mix"])
         if not isinstance(self.params.get("group_by") or [], list):
             raise ValueError("chronos2 group_by must be a list of static_cols")
         self.stats: dict = {}
@@ -280,6 +285,13 @@ class Chronos2(Forecaster):
         training data: slice it to the cutoff first). Weights land in
         out_dir/finetuned-ckpt. Returns training facts for the manifest."""
         ft = self.params["fine_tune"]
+        n_all = int(history[SERIES].nunique())
+        mix_report = None
+        if ft.get("train_mix"):
+            ids, mix_report = select_training_series(history, project, ft["train_mix"])
+            history = history[history[SERIES].isin(ids)]
+            print(f"[chronos2] train_mix: {mix_report['n_selected']:,}/{n_all:,} series, "
+                  f"shares {mix_report['share']}")
         ctx = self._context(history, project)
         max_ctx = int(ft.get("context_length") or self.params.get("context_length") or 0)
         lengths = ctx["ends"] - ctx["starts"]
@@ -302,8 +314,11 @@ class Chronos2(Forecaster):
             remove_printer_callback=True,
         )
         _place(self.pipe, self.device, self.dtype)
-        return {"n_series": len(ctx["sids"]), "n_series_trained": n_eligible,
-                "train_seconds": round(time.perf_counter() - t0, 1)}
+        facts = {"n_series": n_all, "n_series_trained": n_eligible,
+                 "train_seconds": round(time.perf_counter() - t0, 1)}
+        if mix_report is not None:
+            facts["train_mix"] = mix_report
+        return facts
 
     # --- Forecaster interface ------------------------------------------------
 
@@ -319,10 +334,15 @@ class Chronos2(Forecaster):
             print(f"[chronos2] fine-tune cache hit {key} (cutoff {pd.Timestamp(cutoff).date()})")
             self.pipe = _place(_chronos().from_pretrained(str(ckpt)), self.device, self.dtype)
             self.stats["fine_tune_cache"] = "hit"
+            meta = out_dir / "key.json"
+            if meta.exists() and "train_mix" in (saved := json.loads(meta.read_text())):
+                self.stats["train_mix"] = saved["train_mix"]
             return
         facts = self.train(history, project, out_dir)
-        (out_dir / "key.json").write_text(json.dumps({"cutoff": str(pd.Timestamp(cutoff).date()),
-                                                      "fine_tune": ft}, indent=2))
+        meta = {"cutoff": str(pd.Timestamp(cutoff).date()), "fine_tune": ft}
+        if "train_mix" in facts:
+            meta["train_mix"] = self.stats["train_mix"] = facts["train_mix"]
+        (out_dir / "key.json").write_text(json.dumps(meta, indent=2, default=str))
         self.stats.update(fine_tune_cache="miss", fine_tune_seconds=facts["train_seconds"])
 
     def predict(self, history: pd.DataFrame, future: pd.DataFrame, project: ProjectConfig) -> Forecast:

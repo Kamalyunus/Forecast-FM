@@ -1,0 +1,17 @@
+name: chronos2-lora-capped-intermittent
+hypothesis: "Capping intermittent series at 25% of training improves intermittent quantiles without hurting continuous series"
+mechanism: "Enough sparse windows to calibrate upper quantiles, too few to dominate the shared weights"
+rationale: "Test C of the train-mix study"
+model: chronos2
+model_params:
+  fine_tune:
+    mode: lora
+    num_steps: 1000
+    learning_rate: 1.0e-5
+    batch_size: 64
+    train_mix:
+      max_share: {intermittent: 0.25}
+      min_nonzero_days: 4
+      lookback_days: 365
+      seed: 42
+based_on: exp003        # TODO: the ledgered id of 06a

@@ -73,6 +73,10 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
   - Models and paths: `model_defaults` per model family, `reports_dir`, `models_dir`.
   - `python -m forecast_fm config [--check-data]` prints the resolved config.
   - Not supported: frequencies other than daily (`freq: D`).
+- ✅ **Training-series mix** (`train_mix.py`, `fine_tune.train_mix`):
+  - Options: a class filter, `max_share` caps per class, a near-dead-series filter (`min_nonzero_days` over `lookback_days`), a `max_series` cap that keeps the shares, and a seed.
+  - Computed from each fold's history only. The realized mix is recorded in the fold stats, the checkpoint cache and the `finetune` manifest.
+  - `configs/06a-c` set up the study: continuous-only (A), natural mix (B), and intermittent capped at 25% (C).
 - ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 

@@ -1,0 +1,16 @@
+name: chronos2-lora-natural-mix
+hypothesis: "Training on the catalog's natural class mix degrades continuous-series accuracy versus continuous-only"
+mechanism: "At the natural mix most sampled windows are mostly zero, pulling shared weights toward sparse-demand shapes"
+rationale: "Test B of the train-mix study: checks the dilution worry directly on the continuous slices"
+model: chronos2
+model_params:
+  fine_tune:
+    mode: lora
+    num_steps: 1000
+    learning_rate: 1.0e-5
+    batch_size: 64
+    train_mix:
+      min_nonzero_days: 4      # still drop near-dead series
+      lookback_days: 365
+      seed: 42
+based_on: exp003        # TODO: the ledgered id of 06a
