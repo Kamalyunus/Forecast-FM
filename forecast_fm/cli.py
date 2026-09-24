@@ -99,6 +99,17 @@ def cmd_leaderboard(args):
     print(df.to_string(index=False) if not df.empty else "no ledgered experiments yet")
 
 
+def cmd_finetune(args):
+    from .config import load_experiment
+    from .data import load_panel
+    from .finetune import finetune
+
+    project = _project(args)
+    exp = load_experiment(args.config)
+    finetune(project, exp, load_panel(project, args.data), as_of=args.as_of, out=args.out,
+             force=args.force, config_path=args.config)
+
+
 def cmd_forecast(args):
     from .backtest import forecast_at
     from .config import load_experiment
@@ -154,6 +165,14 @@ def main(argv=None):
     r.set_defaults(fn=cmd_run)
 
     sub.add_parser("leaderboard").set_defaults(fn=cmd_leaderboard)
+
+    t = sub.add_parser("finetune", help="fine-tune Chronos-2 on all history and save a checkpoint")
+    t.add_argument("config", help="chronos2 config with a fine_tune: block")
+    t.add_argument("--data")
+    t.add_argument("--as-of", help="last training date (default: last date in the data)")
+    t.add_argument("--out", help="output dir (default: models/<name>-<as_of>)")
+    t.add_argument("--force", action="store_true", help="replace an existing output dir")
+    t.set_defaults(fn=cmd_finetune)
 
     f = sub.add_parser("forecast", help="production forecast from the last date")
     f.add_argument("config")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from forecast_fm.config import ExperimentConfig, ProjectConfig
 from forecast_fm.data import build_panel, prepare_raw
@@ -60,3 +61,29 @@ def make_exp(model: str = "seasonal_naive", **params) -> ExperimentConfig:
 
 def panel_from(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     return build_panel(prepare_raw(raw, project), project)
+
+
+LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+
+@pytest.fixture
+def tiny(monkeypatch, tmp_path):
+    pytest.importorskip("chronos")
+    import torch
+    from chronos import Chronos2Pipeline
+    from chronos.chronos2 import Chronos2Model
+    from chronos.chronos2.config import Chronos2CoreConfig
+
+    torch.manual_seed(0)
+    cfg = Chronos2CoreConfig(
+        d_model=32, d_kv=8, d_ff=64, num_layers=1, num_heads=2, architectures=["Chronos2Model"],
+        chronos_config=dict(context_length=128, input_patch_size=8, input_patch_stride=8,
+                            output_patch_size=8, quantiles=LEVELS, use_reg_token=True,
+                            use_arcsinh=True, max_output_patches=2),
+    )
+    model_dir = tmp_path / "tiny-chronos2"
+    Chronos2Pipeline(model=Chronos2Model(cfg).eval()).model.save_pretrained(model_dir)
+    from forecast_fm.models import chronos2
+
+    monkeypatch.setattr(chronos2, "_PIPELINES", {})
+    return str(model_dir)

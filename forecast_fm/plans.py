@@ -103,6 +103,10 @@ def future_frame(history: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectCo
     if "plan" in by_policy:
         cols = by_policy["plan"]
         if plans is None:
+            if production:
+                raise ValueError(f"a production forecast reads known covariates {cols} from the "
+                                 "latest plan snapshot: set planned_covariates_path to a file "
+                                 "with today's as_of (or use carry_forward for them)")
             raise ValueError(f"policy 'plan' for {cols} but no plan snapshots loaded")
         as_of, snap = snapshot_as_of(plans, cutoff)
         missing_cols = [c for c in cols if c not in snap.columns]

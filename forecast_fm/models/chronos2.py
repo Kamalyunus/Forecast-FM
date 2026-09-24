@@ -65,12 +65,34 @@ def _place(pipe, device: str, dtype: str):
     return pipe
 
 
+MANIFEST = "forecast_fm_model.json"
+CKPT = "finetuned-ckpt"
+
+
+class TrainedOnFutureError(ValueError):
+    """A saved fine-tuned checkpoint was trained on data after the cutoff it is
+    asked to forecast from: evaluating it there would be leakage."""
+
+
+def read_manifest(model_id: str) -> dict | None:
+    """The provenance manifest of a checkpoint saved by `finetune`, or None
+    for a base model (HF id, s3://, or a plain directory)."""
+    path = Path(str(model_id)) / MANIFEST
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def checkpoint_path(model_id: str) -> str:
+    """Where the weights are: a `finetune` output keeps them in finetuned-ckpt/."""
+    return str(Path(model_id) / CKPT) if read_manifest(model_id) else str(model_id)
+
+
 def load_pipeline(model_id: str, device: str, dtype: str = "float32"):
-    """Load once per process from the HF hub, a local directory or s3://."""
+    """Load once per process from the HF hub, a local directory, s3://, or a
+    `finetune` output directory."""
     key = (model_id, device, dtype)
     if key not in _PIPELINES:
         prepare(device)
-        pipe = _place(_chronos().from_pretrained(model_id), device, dtype)
+        pipe = _place(_chronos().from_pretrained(checkpoint_path(model_id)), device, dtype)
         print(f"[chronos2] loaded {model_id} on {device} ({dtype}); "
               f"model_context_length={getattr(pipe, 'model_context_length', '?')}, "
               f"model_prediction_length={getattr(pipe, 'model_prediction_length', '?')}")
@@ -218,44 +240,55 @@ class Chronos2(Forecaster):
 
     def _ft_key(self, history: pd.DataFrame, project: ProjectConfig, cutoff) -> str:
         known, past = self._covariates(history, project)
-        cols = [SERIES, TS, Y, STOCKOUT, *known, *past]
-        data_hash = int(pd.util.hash_pandas_object(history[cols], index=False).sum())
+        model_id = self.params.get("model_id", DEFAULT_MODEL_ID)
         payload = {
-            "model_id": self.params.get("model_id", DEFAULT_MODEL_ID),
+            "model_id": model_id,
+            # a finetune output reused as a base: its identity is its manifest
+            "base_manifest": read_manifest(model_id),
             "dtype": self.params.get("dtype", "float32"),
             "context_length": self.params.get("context_length"),
             "fine_tune": self.params["fine_tune"],
             "known": known, "past": past, "horizon": project.horizon,
             "policy": project.covariate_eval_policy,
             "cutoff": str(pd.Timestamp(cutoff).date()),
-            "n_series": int(history[SERIES].nunique()), "data_hash": data_hash,
+            "n_series": int(history[SERIES].nunique()), "data_hash": history_hash(history, known, past),
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
-    # --- Forecaster interface ------------------------------------------------
-
-    def fit(self, history: pd.DataFrame, project: ProjectConfig, cutoff: pd.Timestamp) -> None:
-        self.device = resolve_device(str(self.params.get("device", "auto")))
-        dtype = str(self.params.get("dtype", "float32"))
+    def _load(self, cutoff: pd.Timestamp) -> None:
         model_id = str(self.params.get("model_id", DEFAULT_MODEL_ID))
-        self.pipe = load_pipeline(model_id, self.device, dtype)
-        self.stats = {"device": self.device, "dtype": dtype}
+        # checked BEFORE loading: a checkpoint trained past the cutoff has seen
+        # the targets it would be scored on
+        manifest = read_manifest(model_id)
+        if manifest is not None and pd.Timestamp(manifest["train_end"]) > pd.Timestamp(cutoff):
+            raise TrainedOnFutureError(
+                f"{model_id} was fine-tuned on data through {manifest['train_end']}; it cannot "
+                f"forecast from cutoff {pd.Timestamp(cutoff).date()}. To backtest a recipe, put "
+                "`fine_tune:` in the config (it retrains per fold); use a saved checkpoint only "
+                "for forecasts from its train_end onwards.")
+        self.device = resolve_device(str(self.params.get("device", "auto")))
+        self.dtype = str(self.params.get("dtype", "float32"))
+        self.pipe = load_pipeline(model_id, self.device, self.dtype)
+        self.stats = {"device": self.device, "dtype": self.dtype}
+        if manifest is not None:
+            self.stats.update(checkpoint=model_id, checkpoint_train_end=manifest["train_end"],
+                              checkpoint_age_days=(pd.Timestamp(cutoff)
+                                                   - pd.Timestamp(manifest["train_end"])).days)
 
-        ft = self.params.get("fine_tune")
-        if ft is None:
-            return
-        key = self._ft_key(history, project, cutoff)
-        out_dir = Path(self.params.get("cache_dir", "reports/chronos2_ft")) / key
-        ckpt = out_dir / "finetuned-ckpt"
-        t0 = time.perf_counter()
-        if ckpt.exists():
-            print(f"[chronos2] fine-tune cache hit {key} (cutoff {pd.Timestamp(cutoff).date()})")
-            self.pipe = _place(_chronos().from_pretrained(str(ckpt)), self.device, dtype)
-            self.stats["fine_tune_cache"] = "hit"
-            return
+    def train(self, history: pd.DataFrame, project: ProjectConfig, out_dir: Path) -> dict:
+        """Fine-tune the loaded pipeline on `history` (every row of it is
+        training data: slice it to the cutoff first). Weights land in
+        out_dir/finetuned-ckpt. Returns training facts for the manifest."""
+        ft = self.params["fine_tune"]
         ctx = self._context(history, project)
         max_ctx = int(ft.get("context_length") or self.params.get("context_length") or 0)
+        lengths = ctx["ends"] - ctx["starts"]
+        n_eligible = int((lengths >= 2 * project.horizon).sum())  # chronos min_past = horizon
+        if n_eligible == 0:
+            raise ValueError(f"no series has >= {2 * project.horizon} days of history "
+                             "(horizon of context + horizon of target); cannot fine-tune")
         inputs = [self._input(ctx, i, None, max_ctx) for i in range(len(ctx["sids"]))]
+        t0 = time.perf_counter()
         self.pipe = self.pipe.fit(
             inputs,
             prediction_length=project.horizon,
@@ -265,12 +298,32 @@ class Chronos2(Forecaster):
             batch_size=int(ft.get("batch_size", 256)),
             context_length=max_ctx or None,
             output_dir=str(out_dir),
+            finetuned_ckpt_name=CKPT,
             remove_printer_callback=True,
         )
-        _place(self.pipe, self.device, dtype)
+        _place(self.pipe, self.device, self.dtype)
+        return {"n_series": len(ctx["sids"]), "n_series_trained": n_eligible,
+                "train_seconds": round(time.perf_counter() - t0, 1)}
+
+    # --- Forecaster interface ------------------------------------------------
+
+    def fit(self, history: pd.DataFrame, project: ProjectConfig, cutoff: pd.Timestamp) -> None:
+        self._load(cutoff)
+        ft = self.params.get("fine_tune")
+        if ft is None:
+            return
+        key = self._ft_key(history, project, cutoff)
+        out_dir = Path(self.params.get("cache_dir", "reports/chronos2_ft")) / key
+        ckpt = out_dir / CKPT
+        if ckpt.exists():
+            print(f"[chronos2] fine-tune cache hit {key} (cutoff {pd.Timestamp(cutoff).date()})")
+            self.pipe = _place(_chronos().from_pretrained(str(ckpt)), self.device, self.dtype)
+            self.stats["fine_tune_cache"] = "hit"
+            return
+        facts = self.train(history, project, out_dir)
         (out_dir / "key.json").write_text(json.dumps({"cutoff": str(pd.Timestamp(cutoff).date()),
                                                       "fine_tune": ft}, indent=2))
-        self.stats.update(fine_tune_cache="miss", fine_tune_seconds=round(time.perf_counter() - t0, 1))
+        self.stats.update(fine_tune_cache="miss", fine_tune_seconds=facts["train_seconds"])
 
     def predict(self, history: pd.DataFrame, future: pd.DataFrame, project: ProjectConfig) -> Forecast:
         H = int(future[HORIZON].max())
@@ -309,6 +362,12 @@ class Chronos2(Forecaster):
         out = np.sort(out, axis=1)
         qd = {w: out[:, j] for j, w in enumerate(wanted)}
         return qd[0.5], {q: qd[q] for q in project.quantiles}
+
+
+def history_hash(history: pd.DataFrame, known: list[str], past: list[str]) -> int:
+    """Order-sensitive fingerprint of exactly the data a model trains on."""
+    cols = [SERIES, TS, Y, STOCKOUT, *known, *past]
+    return int(pd.util.hash_pandas_object(history[cols], index=False).sum())
 
 
 def _series_keys(h: pd.DataFrame) -> np.ndarray:

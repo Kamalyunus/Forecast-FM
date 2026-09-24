@@ -51,6 +51,27 @@ python -m forecast_fm leaderboard
 python -m forecast_fm forecast configs/03_chronos2_zero_shot.yaml      # production forecast
 ```
 
+### Fine-tune once, forecast many times
+
+After the backtest shows the recipe works (a config with `fine_tune:` is
+retrained per fold in `run`), train it once on all history and save it:
+
+```bash
+python -m forecast_fm finetune configs/05_chronos2_lora.yaml            # -> models/chronos2-lora-<date>/
+python -m forecast_fm forecast models/chronos2-lora-<date>/forecast_config.yaml   # every day/week
+```
+
+The output directory holds the weights (`finetuned-ckpt/`), a provenance
+manifest (`forecast_fm_model.json`: base model, recipe, training window,
+data fingerprint, code commit, environment) and a ready `forecast_config.yaml`.
+Existing checkpoints are never overwritten unless you pass `--force`. Retrain on your own
+schedule with a new `--as-of`. Each `forecast` reports the checkpoint's age
+in days.
+
+A saved checkpoint refuses to forecast from any date before its `train_end`,
+so it can never be backtested on data it has already seen. To measure a
+recipe's accuracy, use `run` with `fine_tune:` in the config.
+
 ### Try it on synthetic data
 
 ```bash
@@ -72,6 +93,7 @@ python -m forecast_fm -p examples/demo_project.yaml run configs/03_chronos2_zero
 | `forecast_fm/metrics.py` | WAPE, bias, MASE, wQL, quantile coverage by fold / horizon bucket / demand class |
 | `forecast_fm/models/` | `naive`, `seasonal_naive`, `croston`, `chronos2` |
 | `forecast_fm/device.py` | CUDA / MPS / CPU and dtype selection |
+| `forecast_fm/finetune.py` | production fine-tuning: a saved checkpoint + manifest + forecast config |
 | `forecast_fm/ledger.py` | append-only `experiments/`, verdicts vs `based_on` |
 | `configs/` | experiment configs (one hypothesis each) |
 | `project.yaml` | the fixed project policy (columns marked TODO) |

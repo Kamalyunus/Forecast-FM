@@ -172,27 +172,6 @@ def test_param_validation():
 # --- real library: tiny random Chronos-2 --------------------------------------
 
 
-@pytest.fixture
-def tiny(monkeypatch, tmp_path):
-    pytest.importorskip("chronos")
-    import torch
-    from chronos import Chronos2Pipeline
-    from chronos.chronos2 import Chronos2Model
-    from chronos.chronos2.config import Chronos2CoreConfig
-
-    torch.manual_seed(0)
-    cfg = Chronos2CoreConfig(
-        d_model=32, d_kv=8, d_ff=64, num_layers=1, num_heads=2, architectures=["Chronos2Model"],
-        chronos_config=dict(context_length=128, input_patch_size=8, input_patch_stride=8,
-                            output_patch_size=8, quantiles=LEVELS, use_reg_token=True,
-                            use_arcsinh=True, max_output_patches=2),
-    )
-    model_dir = tmp_path / "tiny-chronos2"
-    Chronos2Pipeline(model=Chronos2Model(cfg).eval()).model.save_pretrained(model_dir)
-    monkeypatch.setattr(chronos2, "_PIPELINES", {})
-    return str(model_dir)
-
-
 @pytest.mark.parametrize("params", [{}, {"group_by": ["category"], "group_size": 3},
                                     {"dtype": "bfloat16"}])
 def test_real_backtest_all_covariate_kinds(tiny, params):

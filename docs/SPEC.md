@@ -26,7 +26,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 38 tests (34 run without torch; 4 need the tiny real Chronos-2).
+`pytest`: 44 tests (36 run without torch; 8 need the tiny real Chronos-2).
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
@@ -60,7 +60,12 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
   - `experiments/expNNN-*/` holds the config, metrics.json, and slice CSVs; `LEDGER.md` gets one row per run; git commits `expNNN [verdict] …`.
   - Verdict rule: `improved` or `regressed` needs both a change larger than `verdict_threshold` and a majority of folds moving the same way. Anything else is `inconclusive`.
   - A ledgered run refuses to start when the code has uncommitted changes. `--no-commit` writes to `reports/scratch/`.
-- ✅ **CLI**: `env, models, audit, sample, cutoffs, run, leaderboard, forecast`.
+- ✅ **Production fine-tuning** (`finetune.py`, `python -m forecast_fm finetune <config>`):
+  - Trains once on history <= `--as-of` (default: the last date).
+  - Saves `models/<name>-<date>/` with `finetuned-ckpt/`, a `forecast_fm_model.json` manifest (base model, recipe and config hash, training window, data hash, code commit, env), and a ready `forecast_config.yaml`.
+  - The output is staged in a `.partial` directory and never overwritten without `--force`.
+  - The chronos2 model refuses a saved checkpoint at any cutoff before its `train_end`, checked before loading. Forecasts report the checkpoint's age in days.
+- ✅ **CLI**: `env, models, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 
 ## 3. Invariants
@@ -148,6 +153,9 @@ Compute scales with (1 + n_covariates) variates per series. Measure accuracy aga
 
 ### WP8: Ship 🔲
 - Success criteria agreed with the user (`success_criteria`). The holdout is evaluated once, only for the promoted recipe (a `promote` command is still to build).
+- Production flow: backtest the recipe with `run` → `finetune` on all history → `forecast` with the saved checkpoint → retrain on a schedule (monthly, say, or when drift shows).
+- 🔲 **Retrain cadence evidence:** backtest a checkpoint trained at cutoff T and forecasting at T + 30/60/90 days (a forward shadow evaluation the guard allows). This shows how fast accuracy decays with checkpoint age.
+- 🔲 **Fine-tuning on 700k series:** train on the stratified sample, or on all series in shards. Compare them on the sample's backtest before choosing.
 - Full 700k production forecast: the promoted config through sharded `forecast` (depends on WP4 and WP5).
 
 ## 5. Open questions for the user ❓

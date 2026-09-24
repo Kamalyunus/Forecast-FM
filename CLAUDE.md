@@ -16,6 +16,9 @@ work is done here**, and wins over the spec when they conflict.
    - plan snapshots with `as_of > cutoff` are never visible;
    - fine-tuning sees fold history only, and the checkpoint cache key includes
      the cutoff and a hash of that history;
+   - a checkpoint saved by `finetune` is never evaluated at a cutoff before
+     its manifest's `train_end` (`TrainedOnFutureError`); recipes are
+     backtested with `fine_tune:` in the config, retrained per fold;
    - every new code path that touches data gets a test in the style of
      `test_backtest_blind_to_future_targets_and_past_covariates`.
 3. **One hypothesis per experiment config**, with `based_on` set, so the
