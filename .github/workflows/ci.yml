@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    # no torch: the stub-pipeline tests must pass without it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -e ".[dev]"
+      - run: ruff check forecast_fm tests examples
+      - run: pytest
+
+  foundation-macos:
+    # Apple Silicon runner: the same arm64 torch/chronos wheels as the target
+    # Mac. GitHub's macOS VMs expose no MPS device, so the tiny-model tests
+    # run on CPU here.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: pip install -e ".[foundation,dev]"
+      - run: python -m forecast_fm env
+      - run: pytest

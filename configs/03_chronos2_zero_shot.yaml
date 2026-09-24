@@ -1,0 +1,11 @@
+name: chronos2-zero-shot
+hypothesis: "Chronos-2 zero-shot with all covariates beats the reference without feature engineering"
+mechanism: "In-context covariate modeling learns price/promo response per series from its own history"
+rationale: "WP7 #3; set based_on to the ledgered reference id"
+model: chronos2
+model_params:
+  device: auto          # cuda > mps > cpu
+  dtype: float32        # try bfloat16 only after a parity check
+  batch_size: 256
+  chunk_series: 4096
+based_on: exp001        # TODO: the ledgered id of the reference run

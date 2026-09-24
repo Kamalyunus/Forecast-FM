@@ -1,0 +1,9 @@
+name: chronos2-lora
+hypothesis: "LoRA fine-tuning on fold history cuts error on promo/event slices"
+mechanism: "Domain adaptation to this catalog's promo response and event spikes"
+rationale: "WP7 #5; based on the best of zero-shot / group_by"
+model: chronos2
+model_params:
+  device: auto
+  fine_tune: {mode: lora, num_steps: 1000, learning_rate: 1.0e-5, batch_size: 64}
+based_on: exp002        # TODO

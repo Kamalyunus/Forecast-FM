@@ -1,0 +1,10 @@
+name: chronos2-group-by-category
+hypothesis: "Cross-learning within category helps short- and intermittent-history series"
+mechanism: "Group attention lets sparse series borrow shape from related series"
+rationale: "WP7 #4; one change vs the zero-shot run"
+model: chronos2
+model_params:
+  device: auto
+  group_by: [category]
+  group_size: 100
+based_on: exp002        # TODO: the ledgered zero-shot id

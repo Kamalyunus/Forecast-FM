@@ -1,0 +1,33 @@
+# Demo project on synthetic data (examples/make_demo_data.py). Same shape as
+# the real project.yaml, with shorter history so folds fit in 3 years.
+name: demo
+data_path: data/demo/sales.parquet
+timestamp_col: date
+target_col: units
+series_id_cols: [sku]
+
+known_covariate_cols: [price, discount_pct, promo_flag, promo_type, sitewide_event]
+past_covariate_cols: [sessions, in_stock]
+static_cols: [category, brand]
+demand_label_col: demand_label
+in_stock_col: in_stock
+covariate_fill: {discount_pct: zero, promo_flag: zero, promo_type: nan, sitewide_event: zero}
+
+covariate_eval_policy:
+  price: plan
+  discount_pct: plan
+  promo_flag: plan
+  promo_type: plan
+  sitewide_event: actual
+planned_covariates_path: data/demo/plan_snapshots.parquet
+
+horizon: 90
+horizon_buckets: [35, 90]
+season_length: 7
+n_folds: 3
+fold_step: 91
+min_train_periods: 400
+holdout_folds: 1
+
+quantiles: [0.1, 0.5, 0.9, 0.95]
+primary_metric: wape

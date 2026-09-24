@@ -1,0 +1,6 @@
+name: seasonal-naive
+hypothesis: "Weekly seasonal naive sets the bar every model must beat"
+mechanism: "Demand repeats its day-of-week shape; last week is a strong no-skill reference"
+rationale: "WP7 #1: reference for all verdicts"
+model: seasonal_naive
+based_on: null

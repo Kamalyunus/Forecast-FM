@@ -1,0 +1,68 @@
+# Replenishment forecasting: decisions at 35-day and 90-day lead times;
+# daily ecommerce demand, ~4 years, ~700k series. Experiments run on a
+# stratified 20-50k series sample (`sample`); winners then run on all series.
+#
+# Every TODO is a placeholder for your real column names (WP1).
+name: ecommerce-replenishment
+
+# --- data -------------------------------------------------------------------
+data_path: data/raw/sales_sample.parquet   # output of `sample`; csv or parquet
+timestamp_col: date                        # TODO
+target_col: units                          # TODO: demand (units sold)
+series_id_cols: [sku]                      # TODO: grain, e.g. [sku] or [sku, warehouse]
+
+# ===== COVARIATES ==============================================================
+# KNOWN: you know every future day's value at forecast time (price you set,
+# the promo calendar). The model gets history AND horizon values.
+known_covariate_cols:          # TODO
+  - price
+  - discount_pct               # 1 - price / regular_price
+  - promo_flag
+  - promo_type                 # categorical
+  - sitewide_event             # 0..N: Black Friday, paydays, holidays
+# PAST: observed only after the fact. History only; never in the horizon.
+# Observed weather belongs here. Weather FORECASTS as issued may be known,
+# fed via plan snapshots.
+past_covariate_cols:           # TODO
+  - sessions
+  - in_stock
+# STATIC: one value per series. Chronos-2 uses them for `group_by`
+# cross-learning, not as covariates.
+static_cols: [category, brand]           # TODO
+demand_label_col: demand_label           # TODO: your intermittent/seasonal/BAU/event/promo label
+in_stock_col: in_stock                   # TODO: 0 = stocked out -> target masked, not scored
+covariate_types: {promo_type: categorical}
+# days with no raw row: demand 0; covariates per this map
+# (default: known -> ffill, past -> nan)
+covariate_fill: {discount_pct: zero, promo_flag: zero, promo_type: nan, sitewide_event: zero}
+grid_end: global
+
+# What the model is GIVEN for the forecast window, in backtest and production:
+#   plan           latest plan snapshot with as_of <= cutoff
+#   actual         realized value: only for fixed calendars
+#   carry_forward  value at the cutoff, held flat
+covariate_eval_policy:
+  price: plan
+  discount_pct: plan
+  promo_flag: plan
+  promo_type: plan
+  sitewide_event: actual
+# Snapshot file: as_of, <timestamp_col>, <series_id_cols...>, <known cols>
+# rows as_of+1 .. as_of+90. Only the `cutoffs` dates are needed.
+planned_covariates_path: data/raw/plan_snapshots.parquet   # TODO
+
+# --- task -------------------------------------------------------------------
+horizon: 90
+horizon_buckets: [35, 90]     # reported as h01-35 and h36-90
+season_length: 7
+
+# --- backtest policy (identical for every experiment) -----------------------
+n_folds: 4
+fold_step: 91
+min_train_periods: 730
+holdout_folds: 1
+
+# --- evaluation ---------------------------------------------------------------
+quantiles: [0.1, 0.5, 0.9, 0.95]   # TODO: include your service-level quantile
+primary_metric: wape
+verdict_threshold: 0.01

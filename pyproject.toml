@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forecast-fm"
+version = "0.1.0"
+description = "Chronos-2 foundation-model demand forecasting for ecommerce replenishment"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "pyarrow>=14",
+  "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+# Apple Silicon: the default PyPI torch wheel includes MPS support
+foundation = [
+  "torch>=2.4",
+  "chronos-forecasting>=2.3,<3",
+  "peft>=0.17",   # fine_tune.mode: lora
+]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+include = ["forecast_fm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
