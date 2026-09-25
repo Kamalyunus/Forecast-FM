@@ -42,6 +42,8 @@ PRIMARY_METRICS = ("wape", "mase", "wql")
 SECTIONS = ("data", "columns", "filters", "preprocessing", "covariates", "plans", "task",
             "backtest", "evaluation", "paths")
 PROFILE_ENV = "FORECAST_FM_PROFILE"
+COLD_START_KEYS = frozenset({"method", "profile_cols", "min_analogs", "new_series_path",
+                             "launch_date_col", "from_plans"})
 
 
 @dataclass
@@ -61,7 +63,10 @@ class ProjectConfig:
     start_date: str | None = None          # drop rows before this date
     end_date: str | None = None            # drop rows after this date
     row_filter: str | None = None          # pandas query, e.g. "channel == 'web'"
-    min_history_days: int = 0              # drop series with a shorter grid
+    # series with less history than this AT A FORECAST ORIGIN are forecast by
+    # the cold-start method instead of the model (decided per cutoff, never
+    # from later data). 0: every series with history goes to the model.
+    min_history_days: int = 0
 
     # --- preprocessing ---------------------------------------------------------
     # new raw columns from pandas expressions over existing ones, e.g.
@@ -121,6 +126,21 @@ class ProjectConfig:
     slice_cols: list[str] = field(default_factory=list)  # statics to break metrics down by
     success_criteria: dict = field(default_factory=dict)
 
+    # --- new series (cold start) --------------------------------------------------
+    # Series with no (or < min_history_days) history at the origin: new SKUs.
+    # See forecast_fm/cold_start.py. Keys: method (launch_profile | zero |
+    # none), profile_cols (statics to pool analogs by, coarsest first),
+    # min_analogs, new_series_path (production: file of upcoming SKUs with
+    # series ids, statics, optional launch date), launch_date_col, from_plans
+    # (series in the plan snapshot without history are new too).
+    cold_start: dict = field(default_factory=dict)
+
+    # --- sharding -------------------------------------------------------------------
+    # static columns that decide the shard (series sharing values stay
+    # together, e.g. [category] for group_by cross-learning); default: the
+    # series id
+    shard_by: list[str] = field(default_factory=list)
+
     # --- models ------------------------------------------------------------------
     # defaults per model family, under each experiment's model_params
     # (the experiment wins), e.g. {chronos2: {device: mps, batch_size: 512}}
@@ -157,6 +177,12 @@ class ProjectConfig:
             one_of(f"covariate_eval_policy[{c}]", p, POLICIES)
             if c not in known:
                 errors.append(f"covariate_eval_policy names {c!r}, which is not a known covariate")
+        unset = [c for c in self.known_covariate_cols if c not in self.covariate_eval_policy]
+        if unset:
+            # no silent default: `actual` would hand the backtest realized future
+            # values of a column that may really be a plan
+            errors.append(f"known covariates {unset} need a covariate_eval_policy entry "
+                          f"({' | '.join(POLICIES)}); 'actual' only for fixed calendars")
         if "plan" in self.covariate_eval_policy.values() and not self.planned_covariates_path:
             errors.append("covariate_eval_policy uses 'plan' but planned_covariates_path is unset")
         for c, f in self.covariate_fill.items():
@@ -166,6 +192,14 @@ class ProjectConfig:
         bad_slices = [c for c in self.slice_cols if c not in static and c != self.demand_label_col]
         if bad_slices:
             errors.append(f"slice_cols {bad_slices} must be static_cols (one value per series)")
+        cs_bad = set(self.cold_start) - COLD_START_KEYS
+        if cs_bad:
+            errors.append(f"cold_start: unknown keys {sorted(cs_bad)}; valid: {sorted(COLD_START_KEYS)}")
+        if "method" in self.cold_start:
+            one_of("cold_start.method", self.cold_start["method"], ("launch_profile", "zero", "none"))
+        bad_shard = [c for c in self.shard_by if c not in static]
+        if bad_shard:
+            errors.append(f"shard_by {bad_shard} must be static_cols")
         if self.in_stock_col and self.stockout_expr:
             errors.append("set in_stock_col or stockout_expr, not both")
 

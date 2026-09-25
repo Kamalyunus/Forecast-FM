@@ -42,8 +42,12 @@ def resolve_dtype(name: str, device: str):
 
 
 def prepare(device: str) -> None:
-    if device.startswith("mps"):
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    """The MPS fallback flag is set in forecast_fm/__init__.py, before torch is
+    imported (setting it here would be too late); warn if it was overridden."""
+    if device.startswith("mps") and os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") != "1":
+        import warnings
+
+        warnings.warn("PYTORCH_ENABLE_MPS_FALLBACK is not 1: ops MPS lacks will raise", stacklevel=2)
 
 
 def empty_cache(device: str) -> None:

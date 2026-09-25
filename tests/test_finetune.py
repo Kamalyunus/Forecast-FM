@@ -116,6 +116,6 @@ def test_cli_finetune_then_forecast(tiny, tmp_path, monkeypatch):
     (tmp_path / "ft.yaml").write_text(yaml.safe_dump(cfg))
 
     main(["finetune", "ft.yaml", "--out", "models/lora"])
-    main(["forecast", "models/lora/forecast_config.yaml", "--out", "fc.parquet"])
-    fc = pd.read_parquet("fc.parquet")
+    main(["forecast", "models/lora/forecast_config.yaml", "--out", "fc"])
+    fc = pd.read_parquet("fc")
     assert fc["series_id"].nunique() == 3 and fc["y_pred"].notna().all()

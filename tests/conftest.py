@@ -51,6 +51,10 @@ def make_project(**kw) -> ProjectConfig:
         n_folds=2, fold_step=14, min_train_periods=60, holdout_folds=1,
         quantiles=[0.1, 0.5, 0.9],
     )
+    # every known covariate needs a policy: default the synthetic ones to
+    # `actual` unless a test sets them
+    known = kw.get("known_covariate_cols", base["known_covariate_cols"])
+    kw["covariate_eval_policy"] = {**{c: "actual" for c in known}, **kw.get("covariate_eval_policy", {})}
     base.update(kw)
     return ProjectConfig(**base)
 

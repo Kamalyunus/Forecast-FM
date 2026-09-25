@@ -26,7 +26,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 58 tests (50 run without torch; 8 need the tiny real Chronos-2).
+`pytest`: 97 tests (87 run without torch; 10 need the tiny real Chronos-2).
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
@@ -77,6 +77,26 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
   - Options: a class filter, `max_share` caps per class, a near-dead-series filter (`min_nonzero_days` over `lookback_days`), a `max_series` cap that keeps the shares, and a seed.
   - Computed from each fold's history only. The realized mix is recorded in the fold stats, the checkpoint cache and the `finetune` manifest.
   - `configs/06a-c` set up the study: continuous-only (A), natural mix (B), and intermittent capped at 25% (C).
+- ✅ **New and short-history series** (`cold_start.py`):
+  - Launch profiles from analogs (series whose launch is observed): the mean and quantiles by days-since-launch, pooled by `profile_cols` with fallback to coarser groups.
+  - `min_history_days` is decided at each origin: series below it go to cold start, scaled by their own sales so far.
+  - New SKUs: in backtests, series first seen within the horizon; in production, `new_series_path` and plan-snapshot SKUs with no history.
+  - Scored as a `lifecycle` slice (established / short_history / new).
+- ✅ **Review fixes** (`tests/test_fixes.py`):
+  - The checkpoint guard reads the manifest one level up, and fine-tuned weights without a manifest are refused. Backtest cache checkpoints carry a manifest.
+  - Croston no longer treats stockout days as zero demand.
+  - `min_history_days` is decided per origin.
+  - Known covariates must have an explicit policy.
+  - Duplicate plan rows raise an error (or keep the last one).
+  - Ledgered runs record the resolved config and invocation, the git check runs before the backtest, and verdicts across different evaluation setups are `incomparable`.
+  - Fine-tuning gets full series, with `context_length` passed to the trainer.
+  - The MPS fallback is set at import.
+  - Categoricals are stored as codes.
+  - Contexts are padded to the cutoff.
+  - Missing predictions are counted.
+  - Summing duplicate rows keeps missing values missing.
+  - The sampler takes `--until` and uses per-day volume.
+  - The fine-tune cache key includes a code fingerprint.
 - ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 
@@ -108,12 +128,14 @@ See `CLAUDE.md`. In short: pipeline only, no leakage, one hypothesis per run, `e
 - ✅ Contract: `as_of, <timestamp_col>, <series_id_cols...>, <known cols>`, with rows for `as_of+1 .. as_of+horizon`, in csv or parquet.
 - 🔲 **Acceptance:** a real backtest with `plan` policies prints coverage ≥ 99% for every covariate.
 
-### WP4: Scale the data path to 700k series on a Mac 🟡
+### WP4: Scale the data path to 700k–3M series on a Mac 🟡
 The grid, classes, metrics and model input assembly are vectorized. But one 700k × 1460 panel is ~1B rows (~40+ GB with covariates) and does **not** fit in 32 GB of unified memory. Chronos-2 forecasts are per series, or per `group_by` group, so **sharding by series is exact**:
-- 🔲 `--shards N --shard i` on `forecast` (and `run`): assign series by a stable hash of series_id. Keep all series of one `group_by` group in the same shard.
-- 🔲 Streamed ETL per shard: a pyarrow filter on the shard's ids, then `build_panel`.
-- 🔲 Merge the shard outputs, and score by summing the metric numerators and denominators across shards.
-- 🔲 Benchmark: rows/s and peak RSS for ETL + classify per shard, and total wall time. Record the numbers in the PR.
+- ✅ `--shards N` on `run` and `forecast`, and `--shard i` on `forecast` for parallel processes. Series are assigned by a stable hash of the series id, or of the `shard_by` statics so a group stays together.
+- ✅ Streamed ETL per shard: the data and plan files are read in batches and only the shard's rows are kept. One streaming pass finds the global date span and series set, so every shard shares the cutoffs and grid end, and a new SKU is told apart from one whose history lives in another shard.
+- ✅ Shard outputs: backtest metrics are combined from additive sums per shard, so they are identical to an unsharded run (tested). Forecast writes one parquet part per shard (the long daily file); it is resumable and writes a manifest.
+- ✅ Categoricals are integer codes in the grid and model inputs; strings are built per series.
+- 🔲 Benchmark on the Mac: rows/s and peak RSS per shard, and total wall time. Choose N so a shard fits the memory budget.
+- Note: cold-start launch profiles pool analogs within a shard. Set `shard_by` = `cold_start.profile_cols` to make them identical to an unsharded run.
 
 **Acceptance:** the full panel runs end to end within a memory budget agreed with the user (e.g. peak RSS < 24 GB on 32 GB).
 

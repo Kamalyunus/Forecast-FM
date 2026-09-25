@@ -147,11 +147,21 @@ def test_stockout_expr():
     assert panel[STOCKOUT].to_numpy().nonzero()[0].tolist() == [0, 10, 20]
 
 
-def test_min_history_days():
-    raw = make_raw(n_series=3, n_days=60)
-    raw = raw[~((raw["sku"] == "S2") & (raw["date"] < "2024-02-20"))]
-    panel = panel_from(raw, make_project(min_history_days=30))
-    assert set(panel[SERIES].cat.categories) == {"S0", "S1"}
+def test_min_history_days_is_decided_at_the_origin():
+    """A short series goes to cold start at an origin where it is short, and
+    to the model later; the panel itself is never filtered on future data."""
+    from forecast_fm.backtest import forecast_at
+
+    raw = make_raw(n_series=3, n_days=120)
+    raw = raw[~((raw["sku"] == "S2") & (raw["date"] < "2024-03-20"))]  # S2 launches 2024-03-20
+    p = make_project(min_history_days=30)
+    panel = panel_from(raw, p)
+    assert set(panel[SERIES].cat.categories) == {"S0", "S1", "S2"}
+    early, _ = forecast_at(panel, pd.Timestamp("2024-04-01"), p, make_exp(), None)
+    late, _ = forecast_at(panel, pd.Timestamp("2024-04-25"), p, make_exp(), None)
+    life = lambda df: df.drop_duplicates(SERIES).set_index(SERIES)["lifecycle"].to_dict()  # noqa: E731
+    assert life(early) == {"S0": "established", "S1": "established", "S2": "short_history"}
+    assert life(late)["S2"] == "established"
 
 
 def test_glob_and_list_inputs(tmp_path, monkeypatch):

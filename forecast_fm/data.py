@@ -50,17 +50,60 @@ def _expand(path: str | Path | list) -> list[Path]:
     return out
 
 
-def _read_one(path: Path, columns: list[str] | None) -> pd.DataFrame:
-    if path.suffix in (".parquet", ".pq") or path.is_dir():
-        return pd.read_parquet(path, columns=columns)
+def _is_parquet(path: Path) -> bool:
+    return path.suffix in (".parquet", ".pq") or path.is_dir()
+
+
+def _read_one(path: Path, columns: list[str] | None, keep, batch_rows: int) -> pd.DataFrame:
+    """Whole file, or (with `keep`) streamed in batches keeping only the rows
+    keep(batch) marks True, so a shard never holds the full dataset."""
+    if _is_parquet(path):
+        if keep is None:
+            return pd.read_parquet(path, columns=columns)
+        import pyarrow.dataset as pads
+
+        parts = []
+        for batch in pads.dataset(str(path), format="parquet").to_batches(columns=columns,
+                                                                         batch_size=batch_rows):
+            df = batch.to_pandas()
+            parts.append(df[keep(df)])
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns)
     if path.suffix in (".csv", ".gz", ".bz2", ".zip") or path.name.endswith((".csv.gz", ".csv.zip")):
-        return pd.read_csv(path, usecols=columns)
+        if keep is None:
+            return pd.read_csv(path, usecols=columns)
+        parts = [df[keep(df)] for df in pd.read_csv(path, usecols=columns, chunksize=batch_rows)]
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=columns)
     raise ValueError(f"unsupported data file {path} (csv or parquet)")
 
 
-def read_table(path: str | Path | list, columns: list[str] | None = None) -> pd.DataFrame:
-    parts = [_read_one(p, columns) for p in _expand(path)]
+def read_table(path: str | Path | list, columns: list[str] | None = None, keep=None,
+               batch_rows: int = 2_000_000) -> pd.DataFrame:
+    parts = [_read_one(p, columns, keep, batch_rows) for p in _expand(path)]
     return parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+
+
+def shard_of(keys: pd.Series, n_shards: int) -> np.ndarray:
+    """Stable shard number per key (same key -> same shard in every run)."""
+    h = pd.util.hash_array(keys.astype(str).to_numpy(dtype=object), categorize=False)
+    return (h % np.uint64(n_shards)).astype(np.int64)
+
+
+def shard_filter(project: ProjectConfig, shard: tuple[int, int] | None):
+    """A row filter for read_table keeping shard i of n (None: keep all).
+    Rows are assigned by series id, or by `shard_by` statics so series that
+    share them (a cross-learning group) land in the same shard."""
+    if shard is None:
+        return None
+    i, n = shard
+    if not 0 <= i < n:
+        raise ValueError(f"shard {i} out of range for {n} shards")
+
+    def keep(df: pd.DataFrame) -> np.ndarray:
+        key = (make_series_id(df, project.shard_by) if project.shard_by
+               else make_series_id(df, project.series_id_cols))
+        return shard_of(key, n) == i
+
+    return keep
 
 
 def apply_derived(df: pd.DataFrame, project: ProjectConfig, strict: bool = True) -> pd.DataFrame:
@@ -90,12 +133,17 @@ def categorical_cols(project: ProjectConfig, df: pd.DataFrame) -> list[str]:
     return out
 
 
-def load_raw(project: ProjectConfig, path: str | Path | list | None = None) -> pd.DataFrame:
+def load_raw(project: ProjectConfig, path: str | Path | list | None = None,
+             shard: tuple[int, int] | None = None) -> pd.DataFrame:
+    """Raw rows, optionally only shard (i, n) of the series."""
     path = path or project.data_path
-    return prepare_raw(read_table(path), project, source=str(path))
+    # a shard may legitimately be empty (few shard_by groups): not an error
+    return prepare_raw(read_table(path, keep=shard_filter(project, shard)), project, source=str(path),
+                       allow_empty=shard is not None)
 
 
-def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data") -> pd.DataFrame:
+def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data",
+                allow_empty: bool = False) -> pd.DataFrame:
     """User data -> canonical raw frame (series_id, ts, y, stockout, ...):
     derived columns, row filter, date window, stockout rule, negative-target
     rule, and duplicate aggregation, in that order."""
@@ -126,7 +174,7 @@ def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data") 
         out = out[out[TS] >= pd.Timestamp(project.start_date)]
     if project.end_date:
         out = out[out[TS] <= pd.Timestamp(project.end_date)]
-    if out.empty:
+    if out.empty and not allow_empty:
         raise ValueError(f"{source}: no rows left after filters")
 
     y = pd.to_numeric(out[Y], errors="coerce")
@@ -148,16 +196,19 @@ def _dedupe(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     dup = raw.duplicated([SERIES, TS], keep=False)
     if not dup.any():
         return raw
-    agg = {c: "last" for c in raw.columns if c not in (SERIES, TS)}
-    agg[Y] = project.duplicates
+    agg = {c: "last" for c in raw.columns if c not in (SERIES, TS, Y)}
     agg[STOCKOUT] = "max"
-    merged = raw[dup].groupby([SERIES, TS], as_index=False, sort=False).agg(agg)
+    g = raw[dup].groupby([SERIES, TS], sort=False)
+    merged = g.agg(agg)
+    # min_count=1: rows whose targets are all missing stay missing, not 0
+    merged[Y] = g[Y].sum(min_count=1) if project.duplicates == "sum" else g[Y].agg(project.duplicates)
+    merged = merged.reset_index()
     print(f"[data] {int(dup.sum()):,} duplicate (series, date) rows -> {len(merged):,} "
           f"({project.duplicates} of the target)")
     return pd.concat([raw[~dup], merged[raw.columns]], ignore_index=True)
 
 
-def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
+def build_panel(raw: pd.DataFrame, project: ProjectConfig, end: pd.Timestamp | None = None) -> pd.DataFrame:
     """Raw rows -> complete daily grid per series.
 
     Each series runs from its first row to the panel's last date (or its own
@@ -166,6 +217,9 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     index arithmetic (offset of the series + days since its start), not by a
     merge.
     """
+    if raw.empty:
+        cols = [SERIES, TS, Y, STOCKOUT, *project.covariate_cols, *project.static_cols]
+        return pd.DataFrame(columns=list(dict.fromkeys(cols)))
     if raw.duplicated([SERIES, TS]).any():
         n = int(raw.duplicated([SERIES, TS]).sum())
         raise ValueError(f"{n} duplicate (series, date) rows; check series_id_cols "
@@ -180,7 +234,11 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     start = np.full(n_series, np.iinfo(np.int64).max)
     np.minimum.at(start, codes, day)
     if project.grid_end == "global":
-        end = np.full(n_series, day.max())
+        # `end`: the whole dataset's last date, so every shard's grid ends on
+        # the same day even if a shard has no row on it
+        last = day.max() if end is None else max(int(np.datetime64(pd.Timestamp(end), "D").astype(np.int64)),
+                                                  int(day.max()))
+        end = np.full(n_series, last)
     else:
         end = np.full(n_series, np.iinfo(np.int64).min)
         np.maximum.at(end, codes, day)
@@ -209,12 +267,16 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
 
     cats = set(categorical_cols(project, raw))
     ffill_cols = []
+    cat_labels: dict[str, pd.Index] = {}
     for c in project.covariate_cols:
         if c in cats:
-            vals = raw[c].astype("string").astype(object)
-            arr = np.full(total, None, dtype=object)
-            arr[pos] = vals.where(vals.notna(), None).to_numpy()
+            # integer codes, never a Python string per row (memory at scale);
+            # -1 = no value, filled like NaN
+            codes, labels = pd.factorize(raw[c].astype("string"), use_na_sentinel=True)
+            arr = np.full(total, np.nan, dtype=np.float32)
+            arr[pos] = np.where(codes < 0, np.nan, codes).astype(np.float32)
             panel[c] = arr
+            cat_labels[c] = pd.Index(labels.astype(str))
         else:
             fill = 0.0 if project.fill(c) == "zero" else np.nan
             arr = np.full(total, fill, dtype=np.float32)
@@ -225,7 +287,13 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     if ffill_cols:
         panel[ffill_cols] = panel.groupby(SERIES, observed=True)[ffill_cols].ffill()
     for c in cats:
-        panel[c] = panel[c].fillna("").astype("category")
+        labels = cat_labels[c]
+        if "" not in labels:
+            labels = labels.append(pd.Index([""]))
+        empty = labels.get_loc("")
+        codes = panel[c].to_numpy()
+        codes = np.where(np.isnan(codes), empty, codes).astype(np.int32)
+        panel[c] = pd.Categorical.from_codes(codes, categories=labels)
 
     statics = [c for c in dict.fromkeys([*project.static_cols, project.demand_label_col]) if c]
     if statics:
@@ -238,17 +306,39 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
     if not np.isclose(got, want, rtol=1e-6, atol=1e-3):
         raise AssertionError(f"target mass changed building the grid: {want} -> {got}")
 
-    if project.min_history_days:
-        keep = lengths >= project.min_history_days
-        if not keep.all():
-            print(f"[data] dropping {int((~keep).sum()):,} series with < {project.min_history_days} days")
-            panel = panel[keep[out_codes]].reset_index(drop=True)
-            panel[SERIES] = panel[SERIES].cat.remove_unused_categories()
     return panel
 
 
-def load_panel(project: ProjectConfig, path: str | Path | None = None) -> pd.DataFrame:
-    return build_panel(load_raw(project, path), project)
+def load_panel(project: ProjectConfig, path: str | Path | None = None,
+               shard: tuple[int, int] | None = None, end: pd.Timestamp | None = None) -> pd.DataFrame:
+    return build_panel(load_raw(project, path, shard), project, end=end)
+
+
+def date_span(project: ProjectConfig, path: str | Path | list | None = None,
+              with_series: bool = False):
+    """(first, last) date of the whole dataset after filters, by one streaming
+    pass: shards need the same fold cutoffs and grid end. With with_series,
+    also the set of every series id (to tell a new SKU from one whose
+    history lives in another shard)."""
+    lo, hi, ids = [], [], set()
+
+    def collect(df: pd.DataFrame) -> np.ndarray:
+        try:
+            r = prepare_raw(df, project)
+        except ValueError as e:
+            if "no rows left" not in str(e):
+                raise
+            return np.zeros(len(df), dtype=bool)
+        lo.append(r[TS].min())
+        hi.append(r[TS].max())
+        if with_series:
+            ids.update(r[SERIES].astype(str).unique())
+        return np.zeros(len(df), dtype=bool)
+
+    read_table(path or project.data_path, keep=collect)
+    if not lo:
+        raise ValueError("no rows in the data after filters")
+    return (min(lo), max(hi), ids) if with_series else (min(lo), max(hi))
 
 
 def demand_classes(panel: pd.DataFrame, project: ProjectConfig, end: pd.Timestamp | None = None) -> pd.Series:

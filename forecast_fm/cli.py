@@ -60,52 +60,39 @@ def cmd_sample(args):
 
     project = _project(args)
     run_sample(project, args.n, args.by, args.volume_bins, args.floor, args.seed, args.out,
-               args.manifest, src=args.src)
+               args.manifest, src=args.src, until=args.until)
 
 
 def cmd_cutoffs(args):
-    from .data import TS, load_raw
+    from .data import date_span
     from .folds import fold_cutoffs
 
     project = _project(args)
-    ts = load_raw(project, args.data)[TS]
-    first, last = ts.min(), ts.max()
+    first, last = date_span(project, args.data)
     for kind, hold in (("validation", False), ("holdout", True)):
         for c in fold_cutoffs(first, last, project, holdout=hold):
             print(f"{kind}\t{c.date()}")
 
 
-def _run_backtest(project, exp, data=None):
-    from .backtest import backtest
-    from .data import SERIES, TS, demand_classes, load_panel
-    from .device import describe
-    from .folds import fold_cutoffs
-    from .metrics import score
-    from .plans import load_plans
-
-    panel = load_panel(project, data)
-    plans = load_plans(project)
-    preds, stats = backtest(panel, project, exp, plans)
-    first_cutoff = fold_cutoffs(panel[TS].min(), panel[TS].max(), project)[0]
-    classes = demand_classes(panel, project, end=first_cutoff)
-    statics = None
-    if project.slice_cols:
-        statics = panel.drop_duplicates(SERIES).set_index(SERIES)[project.slice_cols]
-    result = score(preds, project, classes, statics)
-    result.update(stats=stats, env=describe())
-    return preds, result
-
-
 def cmd_run(args):
     from .config import load_experiment
-    from .ledger import record
+    from .ledger import record, require_clean
+    from .runner import run_backtest
 
     project = _project(args)
     exp = load_experiment(args.config)
-    preds, result = _run_backtest(project, exp, args.data)
-    out = record(exp, project, result, commit=not args.no_commit)
+    if not args.no_commit:
+        require_clean(args.project)  # before the backtest, not after it
+    pred_dir = None
     if args.save_predictions:
-        preds.to_parquet(out / "predictions.parquet", index=False)
+        pred_dir = Path(project.reports_dir) / "predictions" / exp.name
+    result, _ = run_backtest(project, exp, args.data, shards=args.shards, predictions_dir=pred_dir)
+    context = {"project_file": args.project, "profile": args.profile, "overrides": args.set,
+               "data": args.data, "shards": args.shards, "cutoffs": result["cutoffs"],
+               "experiment_file": args.config}
+    record(exp, project, result, commit=not args.no_commit, context=context)
+    if pred_dir:
+        print(f"[run] predictions -> {pred_dir}")
     for name, t in result["tables"].items():
         if name != "bucket_x_class":
             print(f"\n{name}\n{t.to_string(index=False, float_format=lambda v: f'{v:.4f}')}")
@@ -130,23 +117,14 @@ def cmd_finetune(args):
 
 
 def cmd_forecast(args):
-    from .backtest import forecast_at
     from .config import load_experiment
-    from .data import TS, load_panel
-    from .plans import load_plans
+    from .runner import run_forecast
 
     project = _project(args)
     exp = load_experiment(args.config)
-    panel = load_panel(project, args.data)
-    cutoff = panel[TS].max()
-    out, stats = forecast_at(panel, cutoff, project, exp, load_plans(project), production=True)
-    out.insert(0, "cutoff", cutoff)
-    dest = args.out or f"{project.reports_dir}/forecast_{cutoff:%Y%m%d}.parquet"
-    Path(dest).parent.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(dest, index=False)
-    print(f"[forecast] origin {cutoff.date()}: {out['series_id'].nunique():,} series -> {dest}")
-    if stats:
-        print(json.dumps(stats, default=str))
+    only = None if args.shard is None else args.shard
+    run_forecast(project, exp, args.data, shards=args.shards, only=only, out_dir=args.out,
+                 force=args.force)
 
 
 def main(argv=None):
@@ -179,6 +157,9 @@ def main(argv=None):
     s.add_argument("--floor", type=int, default=200)
     s.add_argument("--seed", type=int, default=42)
     s.add_argument("--src", default=None, help="full dataset (default: project data_path)")
+    s.add_argument("--until", default=None,
+                   help="measure volume only up to this date (e.g. the first validation cutoff), "
+                        "so strata never use the backtest period")
     s.add_argument("--out", default="data/raw/sales_sample.parquet")
     s.add_argument("--manifest", default="data/raw/sample_manifest.csv")
     s.set_defaults(fn=cmd_sample)
@@ -191,7 +172,10 @@ def main(argv=None):
     r.add_argument("config")
     r.add_argument("--data")
     r.add_argument("--no-commit", action="store_true", help="debug run: no ledger, no git commit")
-    r.add_argument("--save-predictions", action="store_true")
+    r.add_argument("--save-predictions", action="store_true",
+                   help="write predictions to <reports_dir>/predictions/<name>/")
+    r.add_argument("--shards", type=int, default=1,
+                   help="process series in N shards (bounded memory; metrics are exact)")
     r.set_defaults(fn=cmd_run)
 
     sub.add_parser("leaderboard").set_defaults(fn=cmd_leaderboard)
@@ -204,10 +188,15 @@ def main(argv=None):
     t.add_argument("--force", action="store_true", help="replace an existing output dir")
     t.set_defaults(fn=cmd_finetune)
 
-    f = sub.add_parser("forecast", help="production forecast from the last date")
+    f = sub.add_parser("forecast", help="production forecast from the last date: the long daily "
+                                        "file for every series, new ones included")
     f.add_argument("config")
     f.add_argument("--data")
-    f.add_argument("--out", help="default: <reports_dir>/forecast_<origin>.parquet")
+    f.add_argument("--out", help="output directory (default: <reports_dir>/forecast_<origin>/)")
+    f.add_argument("--shards", type=int, default=1, help="split the series into N shards")
+    f.add_argument("--shard", type=int, action="append",
+                   help="run only this shard (repeatable; run shards as parallel processes)")
+    f.add_argument("--force", action="store_true", help="redo shards whose part already exists")
     f.set_defaults(fn=cmd_forecast)
 
     args = ap.parse_args(argv)

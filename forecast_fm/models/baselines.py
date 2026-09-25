@@ -63,9 +63,11 @@ class Croston(Forecaster):
         cutoff = history[TS].max()
         h = history[history[TS] > cutoff - pd.Timedelta(days=window)]
         y = h[Y].where(~h[STOCKOUT])
-        mat = (pd.DataFrame({SERIES: h[SERIES], TS: h[TS], Y: y})
-               .pivot_table(index=SERIES, columns=TS, values=Y, aggfunc="sum", dropna=False,
-                            observed=True)
+        # pivot (keys are unique), not pivot_table: a sum would turn stocked-out
+        # NaN days into zero-demand days and stretch the demand intervals
+        frame = pd.DataFrame({SERIES: h[SERIES].astype(str).to_numpy(), TS: h[TS].to_numpy(),
+                              Y: y.to_numpy()})
+        mat = (frame.pivot(index=SERIES, columns=TS, values=Y)
                .reindex(columns=pd.date_range(cutoff - pd.Timedelta(days=window - 1), cutoff)))
         Y_ = mat.to_numpy(dtype=np.float64)
         n = Y_.shape[0]
@@ -84,4 +86,4 @@ class Croston(Forecaster):
             q = np.where(hit, 1.0, q + (~np.isnan(v)))
         rate = np.nan_to_num((1 - alpha / 2) * z / p)
         fc = pd.Series(rate, index=mat.index)
-        return future[SERIES].map(fc).astype(float).fillna(0.0).to_numpy(), None
+        return future[SERIES].astype(str).map(fc).astype(float).fillna(0.0).to_numpy(), None

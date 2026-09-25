@@ -46,7 +46,9 @@ Every option is documented in `project.yaml`. Beyond the columns and covariate c
 |---|---|
 | several files / a glob / a parquet folder | `data_path: [a.parquet, "parts/*.csv"]` |
 | compute a column (`1 - price/regular_price`) | `derived_columns` (also applied to plan files) |
-| keep a subset (channel, country, date window) | `row_filter`, `start_date`, `end_date`, `min_history_days` |
+| keep a subset (channel, country, date window) | `row_filter`, `start_date`, `end_date` |
+| new SKUs / short histories | `min_history_days`, `cold_start` |
+| large catalogs | `shard_by`, `--shards N` |
 | repeated (series, date) rows | `duplicates: sum \| mean \| max \| first \| last` |
 | returns / missing days | `negative_target`, `missing_target` |
 | stockouts from stock levels | `stockout_expr: "stock_on_hand <= 0"` |
@@ -78,6 +80,39 @@ python -m forecast_fm run configs/01_seasonal_naive.yaml               # ledgere
 python -m forecast_fm leaderboard
 python -m forecast_fm forecast configs/03_chronos2_zero_shot.yaml      # production forecast
 ```
+
+### Production forecast: the long daily file, sharded
+
+`forecast` writes one row per series × day × horizon step for **every** series,
+new SKUs included:
+
+```
+origin, series_id, <your id cols>, ts, horizon, y_pred, q_0.1, ..., q_0.95, lifecycle, model
+```
+
+`lifecycle` says how each series was forecast. `established` series went to
+the model. `short_history` series (less than `min_history_days` at the origin)
+and `new` series (not launched yet) got a launch profile from past launches in
+their category (`cold_start` in `project.yaml`). New SKUs come from
+`cold_start.new_series_path` (id columns, statics, optional `launch_date`) and
+from plan-snapshot SKUs that have no history.
+
+The output is a directory of parquet parts; `pandas.read_parquet(dir)` reads it all:
+
+```bash
+python -m forecast_fm forecast models/<ckpt>/forecast_config.yaml --shards 16
+# or as parallel processes, one shard each (the last to finish writes _manifest.json):
+python -m forecast_fm forecast <config> --shards 16 --shard 0 &
+python -m forecast_fm forecast <config> --shards 16 --shard 1 &
+```
+
+- **One shard in memory at a time.** Each shard streams only its own rows from
+  the data and the plan files, so memory is bounded by one shard, not the catalog.
+- **Resumable.** A finished part is skipped on rerun; pass `--force` to redo it.
+- **Groups stay together.** `shard_by: [category]` keeps a category in one shard,
+  so `group_by` cross-learning and launch profiles see the whole group.
+- **Sharded backtests.** `run --shards N` gives metrics identical to an
+  unsharded run. Fine-tune recipes are backtested unsharded on the sample.
 
 ### Fine-tune once, forecast many times
 
@@ -143,6 +178,8 @@ python -m forecast_fm -p examples/demo_project.yaml run configs/03_chronos2_zero
 | `forecast_fm/models/` | `naive`, `seasonal_naive`, `croston`, `chronos2` |
 | `forecast_fm/device.py` | CUDA / MPS / CPU and dtype selection |
 | `forecast_fm/train_mix.py` | which series a fine-tune trains on (class filter, share caps, activity) |
+| `forecast_fm/cold_start.py` | new / short-history series: launch profiles from analogs |
+| `forecast_fm/runner.py` | sharded backtest and forecast orchestration (the long daily file) |
 | `forecast_fm/finetune.py` | production fine-tuning: a saved checkpoint + manifest + forecast config |
 | `forecast_fm/ledger.py` | append-only `experiments/`, verdicts vs `based_on` |
 | `configs/` | experiment configs (one hypothesis each) |

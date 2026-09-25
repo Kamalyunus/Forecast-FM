@@ -27,7 +27,6 @@ filters:                   # applied to raw rows, before the daily grid
   start_date: null         # e.g. 2022-01-01: drop older rows (pre-replatform, COVID...)
   end_date: null
   row_filter: null         # pandas query, e.g. "channel == 'web' and country == 'DE'"
-  min_history_days: 0      # drop series whose grid (first row .. last date) is shorter, e.g. 180
 
 preprocessing:
   # new columns from pandas expressions over the raw columns, evaluated in
@@ -113,6 +112,26 @@ evaluation:
 
 # defaults per model family, under each experiment's model_params (the
 # experiment wins): set machine settings once, not in every config
+# --- new and short-history series (cold start) --------------------------------
+# At each forecast origin, series with less history than min_history_days,
+# and SKUs with none yet, get a launch-profile forecast: mean and quantiles
+# of daily demand by days-since-launch across past launches in the same
+# profile_cols group (finest group with >= min_analogs, then coarser, then
+# all). Decided per origin from data <= origin, never from later data.
+min_history_days: 28
+cold_start:
+  method: launch_profile         # launch_profile | zero | none
+  profile_cols: [category]       # coarsest first, e.g. [category, subcategory]
+  min_analogs: 20
+  new_series_path: null          # production: upcoming SKUs (id cols, statics, launch_date)
+  launch_date_col: launch_date
+  from_plans: true               # SKUs in the plan snapshot without history are new too
+
+# --- sharding (python -m forecast_fm forecast ... --shards N) --------------------
+# statics that choose the shard; series sharing them stay together. Match
+# cold_start.profile_cols so launch-profile pools equal an unsharded run.
+shard_by: [category]
+
 model_defaults:
   chronos2:
     device: auto                 # cuda > mps > cpu
@@ -134,4 +153,24 @@ profiles:
     row_filter: "category == 'shoes'"
   # an x86 / CUDA box
   cuda:
-    model_defaults: {chronos2: {device: cuda, dtype: bfloat16, batch_size: 1024}}
+    # --- new and short-history series (cold start) --------------------------------
+# At each forecast origin, series with less history than min_history_days,
+# and SKUs with none yet, get a launch-profile forecast: mean and quantiles
+# of daily demand by days-since-launch across past launches in the same
+# profile_cols group (finest group with >= min_analogs, then coarser, then
+# all). Decided per origin from data <= origin, never from later data.
+min_history_days: 28
+cold_start:
+  method: launch_profile         # launch_profile | zero | none
+  profile_cols: [category]       # coarsest first, e.g. [category, subcategory]
+  min_analogs: 20
+  new_series_path: null          # production: upcoming SKUs (id cols, statics, launch_date)
+  launch_date_col: launch_date
+  from_plans: true               # SKUs in the plan snapshot without history are new too
+
+# --- sharding (python -m forecast_fm forecast ... --shards N) --------------------
+# statics that choose the shard; series sharing them stay together. Match
+# cold_start.profile_cols so launch-profile pools equal an unsharded run.
+shard_by: [category]
+
+model_defaults: {chronos2: {device: cuda, dtype: bfloat16, batch_size: 1024}}

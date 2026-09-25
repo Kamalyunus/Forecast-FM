@@ -28,13 +28,55 @@ AS_OF = "as_of"
 HORIZON = "horizon"
 
 
-def load_plans(project: ProjectConfig) -> pd.DataFrame | None:
+def _needed_as_of(project: ProjectConfig, cutoffs: list[pd.Timestamp]) -> set[pd.Timestamp]:
+    """The snapshot dates the cutoffs will use (latest as_of <= each cutoff),
+    found by streaming only the as_of column."""
+    seen: set = set()
+
+    def collect(df: pd.DataFrame) -> np.ndarray:
+        col = df.rename(columns=project.plan_columns)[project.plan_as_of_col]
+        seen.update(pd.to_datetime(col).dt.normalize().unique())
+        return np.zeros(len(df), dtype=bool)
+
+    read_table(project.planned_covariates_path, keep=collect)
+    dates = sorted(pd.Timestamp(d) for d in seen)
+    out = set()
+    for c in cutoffs:
+        before = [d for d in dates if d <= pd.Timestamp(c)]
+        if before:
+            out.add(before[-1])
+    return out
+
+
+def load_plans(project: ProjectConfig, cutoffs: list[pd.Timestamp] | None = None,
+               series=None) -> pd.DataFrame | None:
     """Plan snapshots: `as_of, <timestamp_col>, <series_id_cols...>, <known
     covariates...>` as csv or parquet; each snapshot covers as_of+1 ..
-    as_of+horizon."""
+    as_of+horizon.
+
+    With `cutoffs`, only the snapshots those cutoffs use are kept; with
+    `series` (a set of ids, or a function ids -> mask), only those series. Both are applied while streaming,
+    so an archive of daily snapshots for millions of series never has to fit
+    in memory."""
     if not project.planned_covariates_path:
         return None
-    df = read_table(project.planned_covariates_path).rename(columns=project.plan_columns)
+    keep = None
+    if cutoffs is not None or series is not None:
+        wanted = _needed_as_of(project, cutoffs) if cutoffs is not None else None
+
+        def keep(df: pd.DataFrame) -> np.ndarray:
+            df = df.rename(columns=project.plan_columns)
+            m = np.ones(len(df), dtype=bool)
+            if wanted is not None:
+                m &= pd.to_datetime(df[project.plan_as_of_col]).dt.normalize().isin(wanted).to_numpy()
+            if series is not None:
+                ids = make_series_id(df, project.series_id_cols)
+                # a set of ids, or a function ids -> bool mask (sharding)
+                m &= (np.asarray(series(ids), dtype=bool) if callable(series)
+                      else ids.isin(series).to_numpy())
+            return m
+
+    df = read_table(project.planned_covariates_path, keep=keep).rename(columns=project.plan_columns)
     df = apply_derived(df, project, strict=False)
     ts_col = project.plan_timestamp_col or project.timestamp_col
     need = [project.plan_as_of_col, ts_col, *project.series_id_cols]
@@ -46,8 +88,15 @@ def load_plans(project: ProjectConfig) -> pd.DataFrame | None:
     df = df.rename(columns={ts_col: TS, project.plan_as_of_col: AS_OF})
     df[TS] = pd.to_datetime(df[TS]).dt.normalize()
     df[AS_OF] = pd.to_datetime(df[AS_OF]).dt.normalize()
-    keep = [c for c in project.known_covariate_cols if c in df.columns]
-    return df[[AS_OF, SERIES, TS, *keep]]
+    cols = [c for c in project.known_covariate_cols if c in df.columns]
+    df = df[[AS_OF, SERIES, TS, *cols]]
+    dup = df.duplicated([AS_OF, SERIES, TS], keep="last")
+    if dup.any():
+        if project.duplicates == "error":
+            raise ValueError(f"plan snapshots: {int(dup.sum()):,} duplicate (as_of, series, date) rows "
+                             "(set duplicates: last to keep the last one)")
+        df = df[~dup]
+    return df
 
 
 def snapshot_as_of(plans: pd.DataFrame, cutoff: pd.Timestamp) -> tuple[pd.Timestamp | None, pd.DataFrame]:

@@ -31,20 +31,39 @@ def _dataset(path: str | Path) -> ds.Dataset:
 
 
 def series_stats(path: str | Path, id_cols: list[str], target: str, by: str | None,
+                 ts_col: str | None = None, until: str | None = None,
                  batch_rows: int = 2_000_000) -> pd.DataFrame:
-    """Per series: [series_id, <id cols>, total, n, <by>] from a streaming scan."""
-    cols = list(dict.fromkeys([*id_cols, target, *([by] if by else [])]))
+    """Per series from a streaming scan: total demand and n = calendar days
+    from its first row to the reference end (`until`, else the data's last
+    date), so total / n is a per-day rate even when zero days have no row.
+    With `until`, rows after it are ignored: strata then never depend on
+    the backtest/holdout period."""
+    cols = list(dict.fromkeys([*id_cols, target, *([by] if by else []), *([ts_col] if ts_col else [])]))
+    cut = pd.Timestamp(until) if until else None
     parts = []
     for batch in _dataset(path).to_batches(columns=cols, batch_size=batch_rows):
         df = batch.to_pandas()
         df[SERIES] = make_series_id(df, id_cols)
-        agg = {"total": (target, "sum"), "n": (target, "size")}
+        if ts_col:
+            df["_ts"] = pd.to_datetime(df[ts_col])
+            if cut is not None:
+                df.loc[df["_ts"] > cut, target] = 0.0
+        else:
+            df["_ts"] = pd.NaT
+        agg = {"total": (target, "sum"), "rows": (target, "size"), "first": ("_ts", "min"),
+               "last": ("_ts", "max")}
         if by:
             agg[by] = (by, "first")
         parts.append(df.groupby(SERIES, sort=False).agg(**agg))
     stats = pd.concat(parts)
-    agg = {"total": "sum", "n": "sum", **({by: "first"} if by else {})}
-    return stats.groupby(level=0).agg(agg)
+    agg = {"total": "sum", "rows": "sum", "first": "min", "last": "max", **({by: "first"} if by else {})}
+    stats = stats.groupby(level=0).agg(agg)
+    if ts_col:
+        end = cut if cut is not None else stats["last"].max()
+        stats["n"] = ((end - stats["first"]).dt.days + 1).clip(lower=1)
+    else:
+        stats["n"] = stats["rows"]
+    return stats
 
 
 def allocate(sizes: pd.Series, n: int, floor: int) -> pd.Series:
@@ -116,9 +135,10 @@ def write_rows(src: str | Path, out: str | Path, id_cols: list[str], keep: set[s
 
 def run_sample(project: ProjectConfig, n: int, by: str | None, volume_bins: int, floor: int,
                seed: int, out: str | Path, manifest: str | Path,
-               src: str | Path | None = None) -> pd.DataFrame:
+               src: str | Path | None = None, until: str | None = None) -> pd.DataFrame:
     src = src or project.data_path
-    stats = series_stats(src, project.series_id_cols, project.target_col, by)
+    stats = series_stats(src, project.series_id_cols, project.target_col, by,
+                         ts_col=project.timestamp_col, until=until)
     picked = stratified_sample(stats, n, by, volume_bins, floor, seed)
     Path(manifest).parent.mkdir(parents=True, exist_ok=True)
     picked.to_csv(manifest, index=False)
