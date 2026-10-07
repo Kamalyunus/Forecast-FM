@@ -107,6 +107,7 @@ See `CLAUDE.md`. In short: pipeline only, no leakage, one hypothesis per run, `e
 ## 4. Work packages
 
 ### WP1: Onboard the real data ❓
+What to export, and in what format: [`DATA_REQUIREMENTS.md`](DATA_REQUIREMENTS.md).
 - 🔲 Replace every `TODO` in `project.yaml` with the real columns.
 - 🔲 Classify every covariate as known / past / static, and write the user's reasons in `experiments/DATA_NOTES.md`.
   - Observed weather goes in `past_covariate_cols`. Weather forecasts as issued may be known, fed via `plan`.

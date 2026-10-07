@@ -5,6 +5,7 @@ Chronos-2 demand forecasting for ecommerce replenishment. Daily demand for
 covariates. The target setup is **an Apple Silicon Mac (MPS)**; CUDA and CPU
 also work.
 
+- `docs/DATA_REQUIREMENTS.md`: **what data to export and in what format** (templates in `docs/data_templates/`)
 - `docs/SPEC.md`: what to build, in what order, with status
 - `CLAUDE.md`: the rules for working in this repo (pipeline, leakage, ledger)
 
