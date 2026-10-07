@@ -163,8 +163,10 @@ def future_frame(history: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectCo
         missing_cols = [c for c in cols if c not in snap.columns]
         if missing_cols:
             raise ValueError(f"plan snapshots have no column(s) {missing_cols}")
-        snap = snap[[SERIES, TS, *cols]].copy()
-        snap[SERIES] = snap[SERIES].astype(fut[SERIES].dtype)
+        snap = snap[[SERIES, TS, *cols]]
+        # only series being forecast here (new SKUs in the plan are cold start)
+        snap = snap[snap[SERIES].astype(str).isin(set(fut[SERIES].astype(str).unique()))].copy()
+        snap[SERIES] = snap[SERIES].astype(str).astype(fut[SERIES].dtype)
         fut = fut.merge(snap, on=[SERIES, TS], how="left")
         coverage = {c: float(fut[c].notna().mean()) for c in cols}
         if verbose:
