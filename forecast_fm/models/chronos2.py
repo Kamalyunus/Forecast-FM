@@ -39,13 +39,13 @@ from ..config import ProjectConfig
 from ..data import SERIES, STOCKOUT, TS, Y, categorical_cols
 from ..device import empty_cache, peak_memory_mb, prepare, resolve_device, resolve_dtype
 from ..plans import HORIZON
-from ..train_mix import select as select_training_series
+from ..train_mix import MAX_POOL_SERIES, profile, select_from_profile
 from ..train_mix import validate as validate_mix
 from .base import Forecast, Forecaster
 
 DEFAULT_MODEL_ID = "amazon/chronos-2"
 FINE_TUNE_KEYS = frozenset({"num_steps", "learning_rate", "mode", "batch_size", "context_length",
-                            "train_mix"})
+                            "train_mix", "rounds", "max_pool_series", "log_every"})
 
 # loaded base pipelines keyed by (model_id, device, dtype): the backtest
 # builds a fresh model per fold; reloading the weights each time is waste
@@ -193,6 +193,12 @@ class Chronos2(Forecaster):
                 raise ValueError("chronos2 fine_tune.mode must be 'full' or 'lora'")
             if ft.get("train_mix") is not None:
                 validate_mix(ft["train_mix"])
+            rounds = int(ft.get("rounds", 1))
+            if rounds < 1:
+                raise ValueError("chronos2 fine_tune.rounds must be >= 1")
+            if rounds > 1 and not (ft.get("train_mix") or {}).get("max_series"):
+                raise ValueError("chronos2 fine_tune.rounds > 1 needs train_mix.max_series: the "
+                                 "number of series drawn per round")
         if not isinstance(self.params.get("group_by") or [], list):
             raise ValueError("chronos2 group_by must be a list of static_cols")
         self.stats: dict = {}
@@ -353,47 +359,129 @@ class Chronos2(Forecaster):
                               checkpoint_age_days=(pd.Timestamp(cutoff)
                                                    - pd.Timestamp(manifest["train_end"])).days)
 
-    def train(self, history: pd.DataFrame, project: ProjectConfig, out_dir: Path) -> dict:
-        """Fine-tune the loaded pipeline on `history` (every row of it is
-        training data: slice it to the cutoff first). Weights land in
-        out_dir/finetuned-ckpt. Returns training facts for the manifest."""
+    def memory_rounds(self, history: pd.DataFrame, project: ProjectConfig):
+        """Round source over in-memory history: each call (round k, ids already
+        used) returns (history of the round's series, their ids, report), or
+        None once the pool is exhausted."""
         ft = self.params["fine_tune"]
-        n_all = int(history[SERIES].nunique())
-        mix_report = None
-        if ft.get("train_mix"):
-            ids, mix_report = select_training_series(history, project, ft["train_mix"])
-            history = history[history[SERIES].isin(ids)]
-            print(f"[chronos2] train_mix: {mix_report['n_selected']:,}/{n_all:,} series, "
-                  f"shares {mix_report['share']}")
-        ctx = self._context(history, project)
+        mix = ft.get("train_mix")
+        limit = int(ft.get("max_pool_series", MAX_POOL_SERIES))
+        if not mix:
+            n = int(history[SERIES].nunique())
+            if n > limit:
+                raise ValueError(f"{n:,} series would be loaded for fine-tuning (limit {limit:,}): set "
+                                 "fine_tune.train_mix.max_series and fine_tune.rounds")
+
+            def everything(k, used):
+                return (history, pd.Index(history[SERIES].astype(str).unique()), None) if k == 0 else None
+            return everything
+        prof = profile(history, project, int(mix.get("lookback_days", 365)))
+
+        def draw(k, used):
+            ids, report = select_from_profile(prof, project, mix, exclude=used, round_index=k,
+                                              max_pool_series=limit)
+            if not len(ids):
+                return None
+            return history[history[SERIES].astype(str).isin(set(ids))], ids, report
+        return draw
+
+    def train(self, history: pd.DataFrame | None, project: ProjectConfig, out_dir: Path,
+              rounds_source=None) -> dict:
+        """Fine-tune the loaded pipeline; the result is saved as one full model
+        in out_dir/finetuned-ckpt. Every row given is training data: slice to
+        the cutoff first.
+
+        With fine_tune.rounds = K, training runs K rounds of num_steps / K
+        steps, each on a fresh stratified draw of train_mix.max_series series
+        disjoint from earlier rounds (`rounds_source` supplies them: in memory,
+        or streamed from disk by `finetune`). LoRA adapters are merged into the
+        weights after each round, and the learning rate steps down linearly
+        across rounds (constant within a round), approximating one schedule
+        over the whole run. Returns training facts for the manifest."""
+        import shutil
+
+        ft = self.params["fine_tune"]
+        rounds = int(ft.get("rounds", 1))
+        total_steps = int(ft.get("num_steps", 1000))
+        per_round = -(-total_steps // rounds)
+        lr = float(ft.get("learning_rate", 1e-6))
+        mode = ft.get("mode", "full")
         max_ctx = int(ft.get("context_length") or self.params.get("context_length") or 0)
-        ctx["gap"][:] = 0  # training windows never need padding
-        lengths = ctx["ends"] - ctx["starts"]
-        n_eligible = int((lengths >= 2 * project.horizon).sum())  # chronos min_past = horizon
-        if n_eligible == 0:
-            raise ValueError(f"no series has >= {2 * project.horizon} days of history "
-                             "(horizon of context + horizon of target); cannot fine-tune")
-        # full series: the trainer samples windows across the whole history and
-        # crops each window's context to `context_length` itself
-        inputs = [self._input(ctx, i, None, 0) for i in range(len(ctx["sids"]))]
-        t0 = time.perf_counter()
-        self.pipe = self.pipe.fit(
-            inputs,
-            prediction_length=project.horizon,
-            finetune_mode=ft.get("mode", "full"),
-            learning_rate=float(ft.get("learning_rate", 1e-6)),
-            num_steps=int(ft.get("num_steps", 1000)),
-            batch_size=int(ft.get("batch_size", 256)),
-            context_length=max_ctx or None,
-            output_dir=str(out_dir),
-            finetuned_ckpt_name=CKPT,
-            remove_printer_callback=True,
-        )
-        _place(self.pipe, self.device, self.dtype)
-        facts = {"n_series": n_all, "n_series_trained": n_eligible,
-                 "train_seconds": round(time.perf_counter() - t0, 1)}
-        if mix_report is not None:
-            facts["train_mix"] = mix_report
+        source = rounds_source or self.memory_rounds(history, project)
+        n_all = int(history[SERIES].nunique()) if history is not None else None
+
+        used: set[str] = set()
+        round_facts, curve = [], []
+        data_hash, train_start, n_trained = 0, None, 0
+        t_all = time.perf_counter()
+        for k in range(rounds):
+            got = source(k, used)
+            if got is None:
+                print(f"[chronos2] round {k + 1}: no series left to draw; stopping after {k} round(s)")
+                break
+            hist_k, ids, report = got
+            used |= set(map(str, ids))
+            ctx = self._context(hist_k, project)
+            lengths = ctx["ends"] - ctx["starts"]
+            eligible = int((lengths >= 2 * project.horizon).sum())  # chronos min_past = horizon
+            if eligible == 0:
+                raise ValueError(f"no series has >= {2 * project.horizon} days of history "
+                                 "(horizon of context + horizon of target); cannot fine-tune")
+            # full series: the trainer samples windows across the whole history
+            # and crops each window's context to `context_length` itself
+            inputs = [self._input(ctx, i, None, 0) for i in range(len(ctx["sids"]))]
+            known, past = self._covariates(hist_k, project)
+            data_hash += history_hash(hist_k, known, past)
+            start = hist_k[TS].min()
+            train_start = start if train_start is None else min(train_start, start)
+            n_trained += eligible
+            lr_k = lr if rounds == 1 else lr * (1 - k / rounds)
+            recorder = _loss_recorder(curve, offset=k * per_round)
+            stage = Path(out_dir) / f".round-{k}"
+            t0 = time.perf_counter()
+            extra = {} if rounds == 1 else {"lr_scheduler_type": "constant"}
+            self.pipe = self.pipe.fit(
+                inputs,
+                prediction_length=project.horizon,
+                finetune_mode=mode,
+                learning_rate=lr_k,
+                num_steps=per_round,
+                batch_size=int(ft.get("batch_size", 256)),
+                context_length=max_ctx or None,
+                output_dir=str(stage),
+                finetuned_ckpt_name=CKPT,
+                remove_printer_callback=True,
+                callbacks=[recorder] if recorder is not None else None,
+                logging_steps=max(1, int(ft.get("log_every", max(1, per_round // 50)))),
+                **extra,
+            )
+            merge = getattr(self.pipe.model, "merge_and_unload", None)
+            if merge is not None:  # LoRA: fold the adapter into the weights before the next round
+                self.pipe.model = merge()
+            _place(self.pipe, self.device, self.dtype)
+            shutil.rmtree(stage, ignore_errors=True)
+            losses = [v for s, v in curve if s > k * per_round]
+            round_facts.append({"round": k, "series": int(len(ids)), "series_trained": eligible,
+                                "steps": per_round, "learning_rate": lr_k,
+                                "seconds": round(time.perf_counter() - t0, 1),
+                                "first_loss": losses[0] if losses else None,
+                                "last_loss": losses[-1] if losses else None,
+                                "mix": report})
+            print(f"[chronos2] round {k + 1}/{rounds}: {len(ids):,} series, {per_round} steps, "
+                  f"lr {lr_k:.2e}, {round_facts[-1]['seconds']}s"
+                  + (f", loss {losses[0]:.4f} -> {losses[-1]:.4f}" if losses else ""))
+        if not round_facts:
+            raise ValueError("fine-tuning drew no series")
+        # one full model (adapters merged), loadable without the base checkpoint
+        self.pipe.save_pretrained(Path(out_dir) / CKPT)
+        facts = {"n_series": n_all if n_all is not None else int(len(used)),
+                 "n_series_trained": n_trained, "rounds": round_facts,
+                 "total_steps": per_round * len(round_facts),
+                 "train_seconds": round(time.perf_counter() - t_all, 1),
+                 "data_hash": data_hash, "train_start": str(pd.Timestamp(train_start).date()),
+                 "loss_curve": _thin(curve, 200)}
+        if len(round_facts) == 1 and round_facts[0]["mix"] is not None:
+            facts["train_mix"] = round_facts[0]["mix"]  # back-compatible single-round report
         return facts
 
     # --- Forecaster interface ------------------------------------------------
@@ -463,6 +551,28 @@ class Chronos2(Forecaster):
         out = np.sort(out, axis=1)
         qd = {w: out[:, j] for j, w in enumerate(wanted)}
         return qd[0.5], {q: qd[q] for q in project.quantiles}
+
+
+def _loss_recorder(curve: list, offset: int):
+    """A transformers callback appending (global step, training loss)."""
+    try:
+        from transformers import TrainerCallback
+    except ImportError:
+        return None
+
+    class _Rec(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kw):
+            if logs and "loss" in logs:
+                curve.append((offset + int(state.global_step), float(logs["loss"])))
+
+    return _Rec()
+
+
+def _thin(curve: list, n: int) -> list:
+    if len(curve) <= n:
+        return curve
+    idx = np.linspace(0, len(curve) - 1, n).round().astype(int)
+    return [curve[i] for i in idx]
 
 
 def history_hash(history: pd.DataFrame, known: list[str], past: list[str]) -> int:

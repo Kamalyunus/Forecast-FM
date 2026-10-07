@@ -172,7 +172,13 @@ export it now if it's easy, so the history exists.
 
 ## How the history is used
 
-**Backtest folds.** With the defaults, counted back from the last date:
+**Backtest folds.** Each fold's cutoff is a *retrain date*. With
+`origin_step_days` (e.g. 7) the fold's model also forecasts from every 7th day
+until the next cutoff, reading the newest history as context but never
+retrained, like production between retrains. Export plan snapshots as of
+**every origin** (`python -m forecast_fm cutoffs` lists them). With the
+defaults (`origin_step_days: null`, one origin per fold), counted back from the
+last date:
 
 | Set | Forecast origin (cutoff) | Used for |
 |---|---|---|

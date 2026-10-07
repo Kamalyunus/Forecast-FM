@@ -115,6 +115,11 @@ class ProjectConfig:
     fold_step: int = 91
     min_train_periods: int = 730
     holdout_folds: int = 1
+    # retrain vs forecast dates: each fold's model is fit once at its cutoff;
+    # with origin_step_days it then forecasts from every step-th day until the
+    # next fold's cutoff (production: retrain now and then, forecast weekly).
+    # None: one forecast origin per fold, at its cutoff.
+    origin_step_days: int | None = None
     cutoffs: list[str] | None = None           # explicit validation cutoffs (override the rule)
     holdout_cutoffs: list[str] | None = None   # explicit holdout cutoffs
 
@@ -208,6 +213,8 @@ class ProjectConfig:
         if (sorted(self.horizon_buckets) != list(self.horizon_buckets) or not self.horizon_buckets
                 or self.horizon_buckets[-1] != self.horizon):
             errors.append("horizon_buckets must be ascending and end at horizon")
+        if self.origin_step_days is not None and self.origin_step_days < 1:
+            errors.append("origin_step_days must be >= 1 (or null)")
         if self.fold_step < 1 or self.n_folds < 1 or self.holdout_folds < 0:
             errors.append("fold_step and n_folds must be >= 1, holdout_folds >= 0")
         for name in ("start_date", "end_date"):

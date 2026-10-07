@@ -1,0 +1,21 @@
+name: chronos2-lora-rounds
+hypothesis: "Training on more distinct SKUs (rounds of fresh stratified draws) beats one draw at equal steps"
+mechanism: "More variety per step: each round sees series the earlier rounds never saw"
+rationale: "Variety test from the scaling discussion; compare with the same total steps in 1 round"
+model: chronos2
+model_params:
+  context_length: 730        # cheaper steps; keep > 1 year for yearly seasonality
+  fine_tune:
+    mode: lora
+    num_steps: 50000         # TOTAL across rounds (5,000 per round here)
+    rounds: 10               # 10 disjoint draws -> up to 500k SKUs over the run
+    learning_rate: 1.0e-5    # steps down linearly across rounds
+    batch_size: 64           # variates per step (target + covariates), ~8 SKUs at 8 variates
+    log_every: 100           # training-loss curve recorded in the manifest
+    train_mix:
+      max_series: 50000      # SKUs drawn (and loaded) per round
+      max_share: {intermittent: 0.25}
+      min_nonzero_days: 4
+      lookback_days: 365
+      seed: 42
+based_on: exp002             # TODO: the same recipe with rounds: 1

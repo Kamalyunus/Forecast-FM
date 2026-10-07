@@ -20,7 +20,7 @@ import pandas as pd
 from . import cold_start
 from .config import ExperimentConfig, ProjectConfig
 from .data import SERIES, STOCKOUT, TS, Y
-from .folds import fold_cutoffs
+from .folds import fold_cutoffs, fold_origins, origin_limit
 from .models import create_model
 from .plans import HORIZON, future_frame
 
@@ -78,14 +78,27 @@ def _new_in_window(panel: pd.DataFrame, project: ProjectConfig, cutoff: pd.Times
     return out
 
 
+def fit_at(panel: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectConfig, exp: ExperimentConfig):
+    """Create the experiment's model and fit it on history <= cutoff (the
+    series established at the cutoff)."""
+    cutoff = pd.Timestamp(cutoff)
+    history = panel[panel[TS] <= cutoff]
+    established, _ = _split_by_history(history, project, cutoff)
+    model = create_model(exp.model, project.model_params(exp.model, exp.model_params))
+    model.fit(history[history[SERIES].isin(established)], project, cutoff)
+    return model
+
+
 def forecast_at(panel: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectConfig,
                 exp: ExperimentConfig, plans: pd.DataFrame | None, production: bool = False,
-                new_series: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict]:
+                new_series: pd.DataFrame | None = None, model=None) -> tuple[pd.DataFrame, dict]:
     """One origin: fit on history <= cutoff, forecast horizon 1..H for every
     series (model for established ones, cold start for the rest).
 
-    `new_series` (production): upcoming series with SERIES, launch_date and
-    statics. In a backtest they come from the panel (first seen in-window)."""
+    `model`: an already-fitted model (fit at an earlier retrain date); it then
+    only reads history <= this origin as context. `new_series` (production):
+    upcoming series with SERIES, launch_date and statics. In a backtest they
+    come from the panel (first seen in-window)."""
     cutoff = pd.Timestamp(cutoff)
     history = panel[panel[TS] <= cutoff]
     established, short = _split_by_history(history, project, cutoff)
@@ -105,8 +118,9 @@ def forecast_at(panel: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectConfi
             actuals = window[[SERIES, TS, *known]]  # declared-known columns only
         future = future_frame(model_history, cutoff, project, plans, actuals=actuals,
                               production=production)
-        model = create_model(exp.model, project.model_params(exp.model, exp.model_params))
-        model.fit(model_history, project, cutoff)
+        if model is None:
+            model = create_model(exp.model, project.model_params(exp.model, exp.model_params))
+            model.fit(model_history, project, cutoff)
         point, qd = model.predict(model_history, future, project)
         out = future[[SERIES, TS, HORIZON]].copy()
         out[SERIES] = out[SERIES].astype(str)
@@ -137,21 +151,38 @@ def forecast_at(panel: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectConfi
 
 def backtest(panel: pd.DataFrame, project: ProjectConfig, exp: ExperimentConfig,
              plans: pd.DataFrame | None = None, holdout: bool = False,
-             cutoffs: list[pd.Timestamp] | None = None) -> tuple[pd.DataFrame, list[dict]]:
+             cutoffs: list[pd.Timestamp] | None = None,
+             origins: list[list[pd.Timestamp]] | None = None) -> tuple[pd.DataFrame, list[dict]]:
+    """Per fold: fit the model once at the fold's cutoff (its retrain date),
+    then forecast from each of the fold's origins (`origin_step_days`), the
+    model reading history <= each origin. Scored on the H days after each
+    origin."""
+    first, last = panel[TS].min(), panel[TS].max()
     if cutoffs is None:
-        cutoffs = fold_cutoffs(panel[TS].min(), panel[TS].max(), project, holdout=holdout)
+        cutoffs = fold_cutoffs(first, last, project, holdout=holdout)
+    if origins is None:
+        limit = last if holdout else origin_limit(first, last, project)
+        origins = fold_origins(cutoffs, project, limit)
     frames, stats = [], []
-    for k, cutoff in enumerate(cutoffs):
-        print(f"[backtest] fold {k} cutoff {cutoff.date()} ({exp.model})")
-        pred, st = forecast_at(panel, cutoff, project, exp, plans)
-        truth = panel[(panel[TS] > cutoff) & (panel[TS] <= cutoff + pd.Timedelta(days=project.horizon))]
-        truth = truth[[SERIES, TS, Y, STOCKOUT]].assign(**{SERIES: truth[SERIES].astype(str)})
-        pred = pred.merge(truth, on=[SERIES, TS], how="left").rename(columns={Y: "y_true"})
-        scale = mase_scale(panel[panel[TS] <= cutoff], project.season_length)
-        scale.index = scale.index.astype(str)
-        pred["mase_scale"] = pred[SERIES].map(scale).astype(np.float32)
-        pred.insert(0, "fold", k)
-        pred.insert(1, "cutoff", cutoff)
-        frames.append(pred)
-        stats.append({"fold": k, "cutoff": str(cutoff.date()), **st})
+    H = pd.Timedelta(days=project.horizon)
+    for k, (cutoff, fold_origs) in enumerate(zip(cutoffs, origins, strict=True)):
+        print(f"[backtest] fold {k} cutoff {cutoff.date()} ({exp.model}), "
+              f"{len(fold_origs)} forecast origin(s)")
+        model = fit_at(panel, cutoff, project, exp)
+        fit_stats = dict(getattr(model, "stats", {}) or {})
+        for origin in fold_origs:
+            pred, st = forecast_at(panel, origin, project, exp, plans, model=model)
+            truth = panel[(panel[TS] > origin) & (panel[TS] <= origin + H)]
+            truth = truth[[SERIES, TS, Y, STOCKOUT]].assign(**{SERIES: truth[SERIES].astype(str)})
+            pred = pred.merge(truth, on=[SERIES, TS], how="left").rename(columns={Y: "y_true"})
+            scale = mase_scale(panel[panel[TS] <= origin], project.season_length)
+            scale.index = scale.index.astype(str)
+            pred["mase_scale"] = pred[SERIES].map(scale).astype(np.float32)
+            pred.insert(0, "fold", k)
+            pred.insert(1, "cutoff", cutoff)
+            pred.insert(2, "origin", origin)
+            pred["model_age_days"] = np.int32((origin - cutoff).days)
+            frames.append(pred)
+            stats.append({"fold": k, "cutoff": str(cutoff.date()), "origin": str(origin.date()),
+                          **fit_stats, **st})
     return pd.concat(frames, ignore_index=True), stats

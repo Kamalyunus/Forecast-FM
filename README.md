@@ -112,6 +112,10 @@ python -m forecast_fm forecast <config> --shards 16 --shard 1 &
 - **Resumable.** A finished part is skipped on rerun; pass `--force` to redo it.
 - **Groups stay together.** `shard_by: [category]` keeps a category in one shard,
   so `group_by` cross-learning and launch profiles see the whole group.
+- **Retrain vs forecast dates.** With `origin_step_days: 7`, each backtest fold
+  fine-tunes once at its cutoff and forecasts weekly from that model until the
+  next cutoff, like production. Results include a `model_age` table (accuracy
+  vs weeks since retraining), which is your retrain-cadence evidence.
 - **Sharded backtests.** `run --shards N` gives metrics identical to an
   unsharded run. Fine-tune recipes are backtested unsharded on the sample.
 
@@ -131,6 +135,37 @@ data fingerprint, code commit, environment) and a ready `forecast_config.yaml`.
 Existing checkpoints are never overwritten unless you pass `--force`. Retrain on your own
 schedule with a new `--as-of`. Each `forecast` reports the checkpoint's age
 in days.
+
+**Before a long run, measure it.** `bench` times training steps and forecast
+throughput on your machine, then estimates the plan:
+
+```bash
+python -m forecast_fm bench configs/07_chronos2_lora_rounds.yaml --catalog 3000000 --memory-gb 24
+# prints: seconds/step, series/s, hours per fine-tune, backtest and production
+# forecast, and the --shards that fit the memory budget (numbers are your Mac's)
+```
+
+**Many SKUs, bounded memory: rounds.** `fine_tune.rounds: K` splits
+`num_steps` into K rounds. Each round draws `train_mix.max_series` new SKUs
+(disjoint from earlier rounds, with the same class mix) and loads only those.
+`finetune` profiles the whole catalog in one streaming pass first, so millions
+of SKUs never sit in memory. LoRA adapters are merged after each round; the
+learning rate steps down across rounds. Training loss per round is recorded in
+the manifest. Without a per-round cap, more than `max_pool_series` (200k) SKUs
+is refused rather than running out of memory.
+
+**What one training step is.** The trainer:
+1. picks `batch_size` variates' worth of SKUs (about 8 SKUs at 8 variates),
+   uniformly from the round's pool;
+2. cuts each SKU's history at a random day: up to `context_length` days before
+   it are the input (target, past covariates, known covariates), and the next 90
+   days are the answer, with the known covariates' actual values for those days;
+3. runs Chronos-2 on the batch (16-day patches, attention across time and across
+   the SKU's variates) and predicts 21 quantiles for each of the 90 days;
+4. scores them with quantile (pinball) loss against the real 90 days;
+5. backpropagates, and AdamW updates the LoRA adapter (or all weights in `full`).
+
+So 50,000 steps ≈ 400,000 SKU windows; the time is steps × seconds per step.
 
 **Choosing the training series** (`fine_tune.train_mix`). The trainer draws
 series uniformly, so the class mix of the training set is the mix the model

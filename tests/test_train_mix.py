@@ -100,6 +100,9 @@ class FitStub:
         self.trained.append([np.asarray(d["target"]).copy() for d in inputs])
         return self
 
+    def save_pretrained(self, path):
+        Path(path).mkdir(parents=True, exist_ok=True)
+
     def predict(self, inputs, prediction_length, cross_learning, batch_size):
         from .test_chronos2 import _T
 

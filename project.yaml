@@ -102,6 +102,13 @@ task:
   season_length: 7
 
 backtest:                        # identical for every experiment
+  # Each fold's cutoff is a RETRAIN date (fine-tuned once there). With
+  # origin_step_days the fold's model then forecasts from every N-th day until
+  # the next cutoff, the way production uses a checkpoint: more evidence per
+  # fine-tune, and a model_age table (accuracy vs weeks since retraining).
+  # Cheap and production-like: n_folds: 2, fold_step: 182, origin_step_days: 7.
+  # Export plan snapshots as_of every origin (`python -m forecast_fm cutoffs`).
+  origin_step_days: null
   n_folds: 4
   fold_step: 91
   min_train_periods: 730

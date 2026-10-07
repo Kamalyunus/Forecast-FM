@@ -33,7 +33,7 @@ from .backtest import LIFECYCLE, backtest, forecast_at
 from .config import ExperimentConfig, ProjectConfig
 from .data import ID_SEP, SERIES, TS, date_span, demand_classes, load_panel, make_series_id, shard_of
 from .device import describe
-from .folds import fold_cutoffs
+from .folds import fold_cutoffs, fold_origins, origin_limit
 from .plans import load_plans
 
 
@@ -61,6 +61,8 @@ def run_backtest(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
     panel = load_panel(project, data) if shards == 1 else None
     first, last = _span(project, data, shards, panel)
     cutoffs = fold_cutoffs(first, last, project)
+    origins = fold_origins(cutoffs, project, origin_limit(first, last, project))
+    all_origins = sorted({o for fold in origins for o in fold})
     parts, stats, kept = [], [], None
     for i in range(shards):
         t0 = time.perf_counter()
@@ -70,8 +72,8 @@ def run_backtest(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
                 continue
             print(f"[shard {i + 1}/{shards}] {panel[SERIES].nunique():,} series")
         ids = set(panel[SERIES].astype(str).unique())
-        plans = load_plans(project, cutoffs=cutoffs, series=ids)
-        preds, st = backtest(panel, project, exp, plans, cutoffs=cutoffs)
+        plans = load_plans(project, cutoffs=all_origins, series=ids)
+        preds, st = backtest(panel, project, exp, plans, cutoffs=cutoffs, origins=origins)
         classes = demand_classes(panel, project, end=cutoffs[0])
         parts.append(metrics.partials(preds, project, classes, _statics(panel, project)))
         stats += [{"shard": i, **s} for s in st] if shards > 1 else st
@@ -86,7 +88,8 @@ def run_backtest(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
     if not parts:
         raise ValueError("no series in any shard")
     result = metrics.result(metrics.combine(parts), project)
-    result.update(stats=stats, env=describe(), cutoffs=cutoffs, shards=shards)
+    result.update(stats=stats, env=describe(), cutoffs=cutoffs, shards=shards,
+                  origins=[[str(o.date()) for o in fold] for fold in origins])
     return result, kept
 
 

@@ -26,7 +26,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 97 tests (87 run without torch; 10 need the tiny real Chronos-2).
+`pytest`: 113 tests (99 run without torch; 14 need the tiny real Chronos-2).
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
@@ -97,6 +97,10 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
   - Summing duplicate rows keeps missing values missing.
   - The sampler takes `--until` and uses per-day volume.
   - The fine-tune cache key includes a code fingerprint.
+- ✅ **Retrain vs forecast dates** (`origin_step_days`): one fit per fold, forecasts from every N-th day until the next fold, never reaching the holdout; a `model_age` metrics table; `cutoffs` lists every origin.
+- ✅ **Multi-round fine-tuning** (`fine_tune.rounds`): disjoint stratified draws per round, LoRA merged between rounds, learning rate stepped down across rounds, one full merged checkpoint saved, loss curve and per-round SKUs in the manifest.
+- ✅ **Scalable `finetune`**: a streaming catalog profile (`train_mix.stream_profile`, identical to the in-memory one), then each round loads only its SKUs. Pools above `max_pool_series` without a cap are refused.
+- ✅ **`bench`**: seconds per training step, forecast series/s and memory, measured on the machine; estimates hours per fine-tune, backtest and production forecast, and the shard count for a memory budget.
 - ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 

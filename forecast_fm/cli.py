@@ -64,14 +64,19 @@ def cmd_sample(args):
 
 
 def cmd_cutoffs(args):
+    """Fold cutoffs (retrain dates) and every forecast origin: export plan
+    snapshots as_of each origin."""
     from .data import date_span
-    from .folds import fold_cutoffs
+    from .folds import fold_cutoffs, fold_origins, origin_limit
 
     project = _project(args)
     first, last = date_span(project, args.data)
-    for kind, hold in (("validation", False), ("holdout", True)):
-        for c in fold_cutoffs(first, last, project, holdout=hold):
-            print(f"{kind}\t{c.date()}")
+    val = fold_cutoffs(first, last, project)
+    for k, fold in enumerate(fold_origins(val, project, origin_limit(first, last, project))):
+        for o in fold:
+            print(f"validation\tfold {k}\tretrain {val[k].date()}\torigin {o.date()}")
+    for c in fold_cutoffs(first, last, project, holdout=True):
+        print(f"holdout\t\tretrain {c.date()}\torigin {c.date()}")
 
 
 def cmd_run(args):
@@ -107,13 +112,23 @@ def cmd_leaderboard(args):
 
 def cmd_finetune(args):
     from .config import load_experiment
-    from .data import load_panel
     from .finetune import finetune
 
     project = _project(args)
     exp = load_experiment(args.config)
-    finetune(project, exp, load_panel(project, args.data), as_of=args.as_of, out=args.out,
+    # streams the catalog: only each round's training series are loaded
+    finetune(project, exp, data=args.data, as_of=args.as_of, out=args.out,
              force=args.force, config_path=args.config)
+
+
+def cmd_bench(args):
+    from .bench import run
+    from .config import load_experiment
+
+    project = _project(args)
+    run(project, load_experiment(args.config), args.out or f"{project.reports_dir}/bench.json",
+        data=args.data, n_series=args.series, train_steps=args.steps, catalog=args.catalog,
+        backtest_series=args.backtest_series, memory_gb=args.memory_gb)
 
 
 def cmd_forecast(args):
@@ -187,6 +202,18 @@ def main(argv=None):
     t.add_argument("--out", help="output dir (default: models/<name>-<as_of>)")
     t.add_argument("--force", action="store_true", help="replace an existing output dir")
     t.set_defaults(fn=cmd_finetune)
+
+    b = sub.add_parser("bench", help="time fine-tuning and forecasting on this machine; "
+                                     "estimate hours and shards for the full plan")
+    b.add_argument("config", help="chronos2 config (with fine_tune: to time training)")
+    b.add_argument("--data")
+    b.add_argument("--series", type=int, default=2000, help="series to measure on (default 2000)")
+    b.add_argument("--steps", type=int, default=50, help="training steps to time (default 50)")
+    b.add_argument("--catalog", type=int, help="catalog size to extrapolate to (default: all in data)")
+    b.add_argument("--backtest-series", type=int, help="series in the backtest (default: all in data)")
+    b.add_argument("--memory-gb", type=float, default=24.0, help="memory budget for shard sizing")
+    b.add_argument("--out", help="default: <reports_dir>/bench.json")
+    b.set_defaults(fn=cmd_bench)
 
     f = sub.add_parser("forecast", help="production forecast from the last date: the long daily "
                                         "file for every series, new ones included")

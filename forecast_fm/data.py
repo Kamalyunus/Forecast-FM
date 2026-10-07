@@ -134,12 +134,20 @@ def categorical_cols(project: ProjectConfig, df: pd.DataFrame) -> list[str]:
 
 
 def load_raw(project: ProjectConfig, path: str | Path | list | None = None,
-             shard: tuple[int, int] | None = None) -> pd.DataFrame:
-    """Raw rows, optionally only shard (i, n) of the series."""
+             shard: tuple[int, int] | None = None, series: set[str] | None = None) -> pd.DataFrame:
+    """Raw rows, optionally only shard (i, n) of the series, or only the
+    series ids in `series` (both streamed: other rows are never kept)."""
     path = path or project.data_path
+    keep = shard_filter(project, shard)
+    if series is not None:
+        wanted = set(map(str, series))
+
+        def keep(df: pd.DataFrame, _shard=keep) -> np.ndarray:  # noqa: F811
+            m = make_series_id(df, project.series_id_cols).isin(wanted).to_numpy()
+            return m & _shard(df) if _shard is not None else m
     # a shard may legitimately be empty (few shard_by groups): not an error
-    return prepare_raw(read_table(path, keep=shard_filter(project, shard)), project, source=str(path),
-                       allow_empty=shard is not None)
+    return prepare_raw(read_table(path, keep=keep), project, source=str(path),
+                       allow_empty=shard is not None or series is not None)
 
 
 def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data",
@@ -310,8 +318,9 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig, end: pd.Timestamp | N
 
 
 def load_panel(project: ProjectConfig, path: str | Path | None = None,
-               shard: tuple[int, int] | None = None, end: pd.Timestamp | None = None) -> pd.DataFrame:
-    return build_panel(load_raw(project, path, shard), project, end=end)
+               shard: tuple[int, int] | None = None, end: pd.Timestamp | None = None,
+               series: set[str] | None = None) -> pd.DataFrame:
+    return build_panel(load_raw(project, path, shard, series), project, end=end)
 
 
 def date_span(project: ProjectConfig, path: str | Path | list | None = None,

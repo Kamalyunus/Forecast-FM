@@ -37,7 +37,7 @@ from .config import ExperimentConfig, ProjectConfig
 from .data import SERIES, TS
 from .device import describe
 from .ledger import code_state
-from .models.chronos2 import CKPT, MANIFEST, Chronos2, history_hash
+from .models.chronos2 import CKPT, MANIFEST, Chronos2
 
 FORMAT_VERSION = 1
 
@@ -47,13 +47,55 @@ def default_out(project: ProjectConfig, exp: ExperimentConfig, as_of: pd.Timesta
     return Path(project.models_dir) / f"{slug}-{as_of:%Y%m%d}"
 
 
-def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame,
+def _streaming_rounds(project: ProjectConfig, params: dict, data, as_of: pd.Timestamp):
+    """Round source that never loads the catalog: one streaming pass builds
+    the per-series profile (class, length, recent activity); each round then
+    reads only its own series from disk."""
+    from .data import load_panel
+    from .train_mix import MAX_POOL_SERIES, select_from_profile, stream_profile
+
+    ft = params["fine_tune"]
+    mix = ft.get("train_mix") or {}
+    limit = int(ft.get("max_pool_series", MAX_POOL_SERIES))
+    prof = stream_profile(project, data, as_of, int(mix.get("lookback_days", 365)))
+    print(f"[finetune] profiled {len(prof):,} series up to {as_of.date()}")
+
+    def draw(k, used):
+        if mix:
+            ids, report = select_from_profile(prof, project, mix, exclude=used, round_index=k,
+                                              max_pool_series=limit)
+        elif k == 0:
+            if len(prof) > limit:
+                raise ValueError(f"{len(prof):,} series would be loaded for fine-tuning (limit {limit:,}): "
+                                 "set fine_tune.train_mix.max_series and fine_tune.rounds")
+            ids, report = pd.Index(prof.index), None
+        else:
+            return None
+        if not len(ids):
+            return None
+        panel = load_panel(project, data, series=set(ids))
+        return panel[panel[TS] <= as_of], ids, report
+
+    return draw
+
+
+def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame | None = None,
              as_of: str | pd.Timestamp | None = None, out: str | Path | None = None,
-             force: bool = False, config_path: str | Path | None = None) -> Path:
-    if exp.model != "chronos2" or not project.model_params(exp.model, exp.model_params).get("fine_tune"):
+             force: bool = False, config_path: str | Path | None = None, data=None) -> Path:
+    """Fine-tune on history <= as_of and save the checkpoint. With `panel`,
+    training series are drawn from it in memory; without, the catalog at
+    `data` (default: project.data_path) is profiled by streaming and each
+    round loads only its own series, so millions of SKUs never sit in memory."""
+    params = project.model_params(exp.model, exp.model_params)
+    if exp.model != "chronos2" or not params.get("fine_tune"):
         raise ValueError("finetune needs a chronos2 config with a `fine_tune:` block "
                          "(e.g. configs/05_chronos2_lora.yaml)")
-    last = panel[TS].max()
+    if panel is not None:
+        last = panel[TS].max()
+    else:
+        from .data import date_span
+
+        _, last = date_span(project, data)
     as_of = last if as_of is None else pd.Timestamp(as_of)
     if as_of > last:
         raise ValueError(f"--as-of {as_of.date()} is after the last date in the data ({last.date()})")
@@ -62,25 +104,32 @@ def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame,
         raise FileExistsError(f"{out} exists; checkpoints are not overwritten (pass --force, "
                               "or choose another --out)")
 
-    history = panel[panel[TS] <= as_of]
-    params = project.model_params(exp.model, exp.model_params)
     model = Chronos2(params)
-    known, past = model._covariates(history, project)
     model._load(as_of)
+    if panel is not None:
+        history = panel[panel[TS] <= as_of]
+        source = model.memory_rounds(history, project)
+        print(f"[finetune] {exp.name}: {history[SERIES].nunique():,} series in memory, up to "
+              f"{as_of.date()}, on {model.device} ({model.dtype})")
+    else:
+        history = None
+        source = _streaming_rounds(project, params, data, as_of)
+        print(f"[finetune] {exp.name}: streaming from {data or project.data_path}, up to "
+              f"{as_of.date()}, on {model.device} ({model.dtype})")
+    known = list(project.known_covariate_cols)
+    past = list(project.past_covariate_cols) if params.get("past_covariates", True) else []
 
     # train into a staging dir so a failed run never leaves a half checkpoint
     stage = out.with_name(out.name + ".partial")
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
-    print(f"[finetune] {exp.name}: {history[SERIES].nunique():,} series, "
-          f"{history[TS].min().date()} .. {as_of.date()}, on {model.device} ({model.dtype})")
-    facts = model.train(history, project, stage)
+    facts = model.train(history, project, stage, rounds_source=source)
 
     base_id = str(params.get("model_id", "amazon/chronos-2"))
     manifest = {
         "format_version": FORMAT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "train_start": str(history[TS].min().date()),
+        "train_start": facts["train_start"],
         "train_end": str(as_of.date()),
         "base_model_id": base_id,
         "recipe": {
@@ -93,7 +142,7 @@ def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame,
                     "horizon": project.horizon, "known_covariates": known,
                     "past_covariates": past, "static_cols": project.static_cols,
                     "covariate_eval_policy": project.covariate_eval_policy},
-        "data_hash": history_hash(history, known, past),
+        "data_hash": facts["data_hash"],
         "training": facts,
         "code": code_state(),
         "env": describe(),

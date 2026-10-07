@@ -59,11 +59,15 @@ def prepare(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | No
             p[c] = sid.map(st[c]).astype(str)
     if LIFECYCLE not in p.columns:
         p[LIFECYCLE] = "established"
+    if "model_age_days" in p.columns:  # weeks since the fold's model was (re)trained
+        p["model_age_weeks"] = (p["model_age_days"] // 7).astype(np.int32)
     return p, int(missing.sum())
 
 
 def table_specs(project: ProjectConfig, with_classes: bool, with_statics: bool) -> dict[str, list[str]]:
     specs = {"overall": [], "fold": ["fold"], "bucket": ["bucket"], LIFECYCLE: [LIFECYCLE]}
+    if project.origin_step_days:
+        specs["model_age"] = ["model_age_weeks"]  # accuracy vs checkpoint age: the retrain curve
     if with_classes:
         specs["demand_class"] = ["demand_class"]
         specs["bucket_x_class"] = ["bucket", "demand_class"]
@@ -85,7 +89,8 @@ def partial(p: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     sums = q.groupby(key, observed=True)[cols].sum()
     sums["n"] = q.groupby(key, observed=True).size()
     s = q[q["mase_scale"] > 0]
-    ser = s.groupby([*key, "fold", SERIES], observed=True).agg(ae=("_ae", "mean"), sc=("mase_scale", "first"))
+    unit = ["fold", "origin", SERIES] if "origin" in q.columns else ["fold", SERIES]
+    ser = s.groupby([*key, *unit], observed=True).agg(ae=("_ae", "mean"), sc=("mase_scale", "first"))
     ratio = (ser["ae"] / ser["sc"]).groupby(level=list(range(len(key))), observed=True)
     sums["_mase_sum"] = ratio.sum().reindex(sums.index).fillna(0.0)
     sums["_mase_n"] = ratio.size().reindex(sums.index).fillna(0).astype(np.int64)
@@ -138,6 +143,8 @@ def combine(parts: list[dict]) -> dict:
 
 def result(parts: dict, project: ProjectConfig) -> dict:
     specs = table_specs(project, "demand_class" in parts, any(c in parts for c in project.slice_cols))
+    if "model_age" not in parts:
+        specs.pop("model_age", None)
     tables = {name: finalize(parts[name], by) for name, by in specs.items() if name in parts}
     overall = _clean(tables.pop("overall").iloc[0].to_dict())
     overall["n_missing_pred"] = int(parts.get("_missing_pred", 0))

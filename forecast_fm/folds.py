@@ -50,3 +50,36 @@ def fold_cutoffs(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig
         raise ValueError("no fold cutoff leaves min_train_periods of history; "
                          "lower min_train_periods or n_folds")
     return kept
+
+
+def origin_limit(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig) -> pd.Timestamp:
+    """The date no validation forecast window may pass: the first holdout
+    cutoff (validation never scores the holdout period), else the last date."""
+    if project.holdout_cutoffs or project.holdout_folds:
+        try:
+            return min(fold_cutoffs(first, last, project, holdout=True))
+        except ValueError:
+            pass
+    return pd.Timestamp(last)
+
+
+def fold_origins(cutoffs: list[pd.Timestamp], project: ProjectConfig,
+                 limit: pd.Timestamp) -> list[list[pd.Timestamp]]:
+    """Forecast origins per fold. A fold's model is fit once at its cutoff and
+    forecasts from cutoff, cutoff + step, ... before the next fold's cutoff,
+    each origin's horizon ending by `limit`. Without origin_step_days: just
+    the cutoff."""
+    step = project.origin_step_days
+    H = pd.Timedelta(days=project.horizon)
+    out = []
+    for i, c in enumerate(cutoffs):
+        if not step:
+            out.append([c])
+            continue
+        nxt = cutoffs[i + 1] if i + 1 < len(cutoffs) else None
+        origins, o = [], c
+        while (nxt is None or o < nxt) and o + H <= limit:
+            origins.append(o)
+            o = o + pd.Timedelta(days=step)
+        out.append(origins or [c])
+    return out
