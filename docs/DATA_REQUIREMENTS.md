@@ -48,7 +48,7 @@ system, set `missing_target: nan`.
 | `date` | date | yes | The sales day. |
 | `sku` (+ e.g. `warehouse`) | text | yes | The series key: the grain you order at. A (series, date) pair must be unique, or set `duplicates: sum`. |
 | `units` | number | yes | Demand: units sold that day. Returns: net them out, or keep them separate and set `negative_target`. |
-| `in_stock` | 0/1 | strongly recommended | **0 = stocked out that day.** Those days are hidden from the model and not scored, because sales were capped by stock rather than demand. Blank counts as in stock. Alternative: give stock on hand and set `stockout_expr: "stock_on_hand <= 0"`. |
+| `oos_hours` | number 0–24 | strongly recommended | **Hours out of stock that day** (13 = OOS 13 of 24 hours). See *Out-of-stock hours* below. Other forms also work: a 0/1 `in_stock` flag (`in_stock_col`), or stock on hand (`stockout_expr: "stock_on_hand <= 0"`). |
 | `price` | number | recommended | The selling price that day. |
 | `discount_pct` | number 0–1 | recommended | `1 - price / regular_price`. Or export `regular_price` and set `derived_columns: {discount_pct: "1 - price / regular_price"}`. |
 | `promo_flag` | 0/1 | recommended | A promotion was running. |
@@ -58,12 +58,40 @@ system, set `missing_target: nan`.
 | `category`, `brand` | text | recommended | Static attributes, one value per SKU. The first value seen is used. They drive metric slices, sharding (`shard_by`), cross-learning (`group_by`) and new-SKU profiles. |
 | `demand_label` | text | optional | Your class per SKU: `intermittent`, `seasonal`, `BAU`, `event`, `promo`. If absent, classes are computed (smooth / erratic / intermittent / lumpy). Used for metric slices and `fine_tune.train_mix`. |
 
+### Out-of-stock hours
+
+Sales on a day that was out of stock for part of it understate demand. The
+default `project.yaml` handles `oos_hours` two ways:
+
+```yaml
+derived_columns:
+  availability: "1 - oos_hours.clip(0, 24) / 24"   # share of the day on sale
+past_covariate_cols: [sessions, availability]
+stockout_expr: "oos_hours >= 12"                   # mostly-OOS days = censored
+```
+
+- **Mostly-OOS days** (at or above the threshold) are *censored*: the model
+  sees them as missing demand, not as low demand, and they are not scored.
+- **Partly-OOS days** (below the threshold) keep their actual sales, and
+  `availability` tells the model why they are low, so it can learn the
+  dampening instead of mistaking it for weak demand.
+- **The threshold is a choice.** Look at the `oos_hours` distribution in the
+  audit, then test 6 / 12 / 18 as one experiment each. Lower thresholds
+  censor more days but lose more data.
+- **Time of day matters.** An outage overnight costs fewer sales than one at
+  peak hours. If you can, export *lost-peak* hours, or an hourly-sales-weighted
+  availability, instead of clock hours.
+- **Days with no sales row** have unknown availability (left missing, not
+  "fully on sale"). If your export only has rows for days with sales, add
+  `oos_hours` rows for zero-sales days too, otherwise a fully-OOS day with no
+  sales looks like a normal zero-demand day.
+
 **Each extra column needs a class.** Declare it in `project.yaml` as one of:
 
 | Class | Rule | Examples | What the model gets |
 |---|---|---|---|
 | **known** (`known_covariate_cols`) | You know the value for every future day at forecast time. | price, promo calendar, events | History, plus the 90 future days from the plan snapshot |
-| **past** (`past_covariate_cols`) | Only known after the fact. | sessions, stock, **observed** weather | History only |
+| **past** (`past_covariate_cols`) | Only known after the fact. | sessions, availability, **observed** weather | History only |
 | **static** (`static_cols`) | One value per SKU. | category, brand, size | Used for groups and slices, not as a model input |
 
 Every known covariate also needs a `covariate_eval_policy` entry: `plan`
@@ -142,6 +170,37 @@ export it now if it's easy, so the history exists.
 
 ---
 
+## How the history is used
+
+**Backtest folds.** With the defaults, counted back from the last date:
+
+| Set | Forecast origin (cutoff) | Used for |
+|---|---|---|
+| validation folds 1–4 | last − 454, −363, −272, −181 days | comparing experiments (zero-shot vs fine-tuned, settings) |
+| holdout | last − 90 days | the final, once-only check of the chosen recipe |
+
+Each fold uses **all history up to its cutoff** (an expanding window) and is
+scored on the 90 days after it. Validation windows never overlap the holdout.
+
+**What Chronos-2 does with that history:**
+- **Zero-shot:** no training on your data. At each origin it reads the last
+  `context_length` days of each series (default: all of it, up to the model's
+  limit, printed at load) plus covariates, and forecasts. There is no explicit
+  recency weight. The pretrained model's attention learns to weigh recent
+  level and trend against older seasonal patterns.
+- **Fine-tuning:** trains on windows cut at random points across the **whole**
+  history, all years equally likely, each with up to `context_length` days of
+  context and the next 90 days as the target. It runs a fixed `num_steps`;
+  there is no internal validation set or early stopping. The validation folds
+  above are what judge it.
+- **Production `finetune`:** trains on everything up to `--as-of`; the folds
+  only ever choose the recipe.
+
+**Levers if old years hurt** (each one is an experiment):
+- `start_date` drops history before a regime change (re-platform, COVID).
+- `context_length` (e.g. 730) makes the model read less history. Keep it ≥ 1
+  year plus a margin so yearly seasonality stays visible.
+
 ## Before the first run: checklist
 
 1. Put the files under `data/raw/` and fill in the `TODO`s in `project.yaml`.
@@ -157,8 +216,9 @@ export it now if it's easy, so the history exists.
 
 - **Grain:** SKU, or SKU × warehouse / channel? The order decision decides.
 - **Demand:** gross units or net of returns? Are cancelled orders included?
-- **Stockouts:** is there a daily in-stock flag or stock-on-hand? Without
-  one, lost sales look like zero demand.
+- **Stockouts:** are `oos_hours` recorded on zero-sales days too? Are they
+  clock hours, or weighted by when sales happen? Without a stock signal, lost
+  sales look like zero demand.
 - **Zero days:** does a missing row mean 0 sales, or "no data"?
 - **Plans:** are past price and promo plans archived by issue date? Since when?
 - **Weather:** observed (a past covariate), or forecasts as issued (known, via plans)?

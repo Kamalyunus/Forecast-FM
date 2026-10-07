@@ -1,6 +1,6 @@
-date,sku,units,price,discount_pct,promo_flag,promo_type,sitewide_event,sessions,in_stock,category,brand,demand_label
-2026-09-28,SKU-1001,14,19.99,0.0,0,none,0,412,1,shoes,acme,BAU
-2026-09-29,SKU-1001,31,15.99,0.2,1,pct_off,0,1290,1,shoes,acme,BAU
-2026-09-30,SKU-1001,0,15.99,0.2,1,pct_off,0,880,0,shoes,acme,BAU
-2026-09-28,SKU-2002,2,49.00,0.0,0,none,0,57,1,bags,zeta,intermittent
-2026-09-30,SKU-2002,1,49.00,0.0,0,none,0,61,1,bags,zeta,intermittent
+date,sku,units,price,discount_pct,promo_flag,promo_type,sitewide_event,sessions,oos_hours,category,brand,demand_label
+2026-09-28,SKU-1001,14,19.99,0.0,0,none,0,412,0,shoes,acme,BAU
+2026-09-29,SKU-1001,31,15.99,0.2,1,pct_off,0,1290,3,shoes,acme,BAU
+2026-09-30,SKU-1001,0,15.99,0.2,1,pct_off,0,880,18,shoes,acme,BAU
+2026-09-28,SKU-2002,2,49.00,0.0,0,none,0,57,0,bags,zeta,intermittent
+2026-09-30,SKU-2002,1,49.00,0.0,0,none,0,61,0,bags,zeta,intermittent

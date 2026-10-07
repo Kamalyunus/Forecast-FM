@@ -33,6 +33,8 @@ preprocessing:
   # order (a later one may use an earlier one). They are also applied to
   # plan snapshots whenever the inputs are there.
   derived_columns:
+    # share of the day the item was on sale (oos_hours: hours out of stock, 0-24)
+    availability: "1 - oos_hours.clip(0, 24) / 24"
     # discount_pct: "1 - price / regular_price"
     # net_units: "units - returns"       # then target_col: net_units
   duplicates: error        # repeated (series, date) rows: error | sum | mean | max | first | last
@@ -54,7 +56,7 @@ covariates:
   # fed via plan snapshots.
   past_covariate_cols:           # TODO
     - sessions
-    - in_stock
+    - availability               # derived above: the model learns how partial OOS dampens sales
   # STATIC: one value per series. Chronos-2 uses them for `group_by`
   # cross-learning; `slice_cols` below breaks metrics down by them.
   static_cols: [category, brand]           # TODO
@@ -62,10 +64,15 @@ covariates:
   covariate_types: {promo_type: categorical}   # pin numeric | categorical where inference is wrong
   # days with no raw row: ffill | zero | nan (default: known -> ffill, past -> nan)
   covariate_fill: {discount_pct: zero, promo_flag: zero, promo_type: nan, sitewide_event: zero}
+  # days with no sales row: oos_hours unknown -> availability NaN (missing, not "fully on sale")
   # Stockouts (the target is hidden from the model and not scored). Either
-  # a column where 0 = stocked out, or an expression that is True on stockouts:
-  in_stock_col: in_stock                   # TODO
-  stockout_expr: null                      # e.g. "stock_on_hand <= 0 and units == 0"
+  # a column where 0 = stocked out, or an expression that is True on stockouts.
+  # With hours out of stock: days OOS for at least this many hours count as
+  # censored; shorter outages stay as observed sales, with `availability`
+  # telling the model why they are low. Check the oos_hours distribution in
+  # the audit and test the threshold (6 / 12 / 18) as an experiment.
+  in_stock_col: null
+  stockout_expr: "oos_hours >= 12"         # TODO: your threshold
 
 plans:
   # What the model is GIVEN for the forecast window, in backtest and

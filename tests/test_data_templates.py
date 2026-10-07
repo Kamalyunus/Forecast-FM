@@ -28,9 +28,14 @@ def test_templates_load_with_the_repo_project_yaml():
     p = _project()
     panel = build_panel(load_raw(p), p)
     assert set(panel[SERIES].astype(str)) == {"SKU-1001", "SKU-2002"}
-    # in_stock = 0 marks a stockout; SKU-2002's missing 09-29 row is a zero-sales day
-    assert panel.loc[(panel[SERIES] == "SKU-1001") & (panel[TS] == "2026-09-30"), STOCKOUT].item()
-    assert panel.loc[(panel[SERIES] == "SKU-2002") & (panel[TS] == "2026-09-29"), "y"].item() == 0
+    day = lambda sku, d: panel[(panel[SERIES] == sku) & (panel[TS] == d)].iloc[0]  # noqa: E731
+    # oos_hours: 18h out of stock -> censored day; 3h -> kept, availability 21/24
+    assert day("SKU-1001", "2026-09-30")[STOCKOUT]
+    assert not day("SKU-1001", "2026-09-29")[STOCKOUT]
+    assert day("SKU-1001", "2026-09-29")["availability"] == pytest.approx(0.875)
+    # SKU-2002's missing 09-29 row: zero sales, availability unknown (not "fully on sale")
+    assert day("SKU-2002", "2026-09-29")["y"] == 0
+    assert pd.isna(day("SKU-2002", "2026-09-29")["availability"])
 
     origin = panel[TS].max()
     plans = load_plans(p)
