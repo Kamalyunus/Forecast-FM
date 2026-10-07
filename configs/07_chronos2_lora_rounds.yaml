@@ -10,6 +10,7 @@ model_params:
     num_steps: 50000         # TOTAL across rounds (5,000 per round here)
     rounds: 10               # 10 disjoint draws -> up to 500k SKUs over the run
     learning_rate: 1.0e-5    # steps down linearly across rounds
+    train_window_days: 730   # fixed window: targets from the last 2 years only, like production
     batch_size: 64           # variates per step (target + covariates), ~8 SKUs at 8 variates
     log_every: 100           # training-loss curve recorded in the manifest
     train_mix:

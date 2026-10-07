@@ -176,3 +176,65 @@ def test_bench_runs_and_extrapolates(tiny, tmp_path):
     assert plan["finetune_hours"] >= 0 and plan["backtest"]["fine_tunes"] == 1
     assert plan["backtest"]["forecast_origins"] > 1 and plan["shards_for_memory_budget"]["shards"] >= 1
     assert "production forecast of 3,000,000 series" in render(res)
+
+
+@pytest.mark.parametrize("length", [28, 60, 150, 250, 299, 300, 1000])
+def test_fixed_window_targets_stay_in_the_window(length):
+    """Simulate the trainer's cut rule (uniform in [min_past, len - H], context
+    = the C days before): every target starts inside the last W real days, and
+    every real day from max(H, len - W) is a possible cut."""
+    from forecast_fm.models.chronos2 import fixed_window
+
+    W, C, H = 200, 100, 14
+    y = np.arange(length, dtype=np.float32)  # value = real day index
+    d = fixed_window({"target": y, "past_covariates": {"t": np.array(["x"] * length)}}, W, C, H)
+    t = d["target"]
+    assert len(t) >= C + H  # never filtered out by the trainer
+    cuts = range(C, len(t) - H + 1)  # min_past = C
+    first_real = [t[c] for c in cuts]  # the target's first day, in real days
+    assert min(first_real) == max(H, length - W) and max(first_real) == length - H
+    for c in (cuts[0], cuts[-1]):
+        ctx = t[max(0, c - C):c]
+        real = ctx[~np.isnan(ctx)]
+        assert len(real) == min(C, int(t[c]))  # real context: all available, up to C
+    assert (d["past_covariates"]["t"][np.isnan(t)] == "").all()  # categorical pad token
+
+
+def test_fixed_window_passes_min_past_to_trainer(monkeypatch, tmp_path):
+    from .test_train_mix import FitStub
+
+    stub, seen = FitStub(), {}
+    orig = stub.fit
+
+    def fit(inputs, output_dir, **kw):
+        seen.update(kw)
+        return orig(inputs, output_dir, **kw)
+
+    stub.fit = fit
+    monkeypatch.setattr(chronos2, "resolve_device", lambda d: "cpu")
+    monkeypatch.setattr(chronos2, "resolve_dtype", lambda *a: None)
+    monkeypatch.setitem(chronos2._PIPELINES, ("stub", "cpu", "float32"), stub)
+    p = _project()
+    panel = panel_from(_catalog(n=4, n_days=400), p)
+    m = create_model("chronos2", {"model_id": "stub", "cache_dir": str(tmp_path), "context_length": 60,
+                                  "fine_tune": {"num_steps": 1, "train_window_days": 90}})
+    m.fit(panel, p, panel[TS].max())
+    assert seen["min_past"] == 60
+    assert all(len(t) == 150 for t in stub.trained[0])  # last window + context days, not 400
+    with pytest.raises(ValueError, match="horizon"):
+        create_model("chronos2", {"model_id": "stub", "cache_dir": str(tmp_path),
+                                  "fine_tune": {"num_steps": 1, "train_window_days": 7}}).fit(
+            panel, p, panel[TS].max())
+
+
+def test_real_fixed_window_finetune(tiny, tmp_path):
+    from forecast_fm.finetune import finetune
+
+    p = _project()
+    panel = panel_from(_catalog(n=6, n_days=200), p)
+    exp = ExperimentConfig(name="w", hypothesis="h", model="chronos2", model_params={
+        "model_id": tiny, "device": "cpu", "context_length": 32,
+        "fine_tune": {"num_steps": 3, "batch_size": 4, "train_window_days": 60}})
+    out = finetune(p, exp, panel, out=tmp_path / "m")
+    man = json.loads((out / "forecast_fm_model.json").read_text())
+    assert man["training"]["train_window_days"] == 60

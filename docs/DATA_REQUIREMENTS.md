@@ -194,13 +194,16 @@ scored on the 90 days after it. Validation windows never overlap the holdout.
   limit, printed at load) plus covariates, and forecasts. There is no explicit
   recency weight. The pretrained model's attention learns to weigh recent
   level and trend against older seasonal patterns.
-- **Fine-tuning:** trains on windows cut at random points across the **whole**
-  history, all years equally likely, each with up to `context_length` days of
-  context and the next 90 days as the target. It runs a fixed `num_steps`;
+- **Fine-tuning:** by default trains on windows cut at random points across the
+  **whole** history (an expanding window), all years equally likely. With
+  `fine_tune.train_window_days: W`, it uses only targets in the last W days
+  before the cutoff (a fixed window). Each training window has up to
+  `context_length` days of context and the next 90 days as the target. It runs
+  a fixed `num_steps`;
   there is no internal validation set or early stopping. The validation folds
   above are what judge it.
-- **Production `finetune`:** trains on everything up to `--as-of`; the folds
-  only ever choose the recipe.
+- **Production `finetune`:** trains on history up to `--as-of`, or only its last
+  W days with `train_window_days`. The folds only ever choose the recipe.
 
 **Levers if old years hurt** (each one is an experiment):
 - `start_date` drops history before a regime change (re-platform, COVID).

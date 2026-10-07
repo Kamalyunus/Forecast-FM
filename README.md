@@ -154,6 +154,16 @@ learning rate steps down across rounds. Training loss per round is recorded in
 the manifest. Without a per-round cap, more than `max_pool_series` (200k) SKUs
 is refused rather than running out of memory.
 
+**Fixed-window training** (`fine_tune.train_window_days: 730`). By default a
+fine-tune learns from the whole history up to its cutoff, an expanding
+window, so a later fold trains on more years than an earlier one. With a fixed
+window, every fine-tune learns only from targets in the last W days before its
+cutoff (each with up to `context_length` days of real history before it, as at
+inference). Every fold's model and the production model then train on the same
+amount of recent data. Young SKUs still train from their first possible day.
+The window is recorded in the manifest. Pair it with `context_length`, which is
+the fixed window the model *reads* at forecast time.
+
 **What one training step is.** The trainer:
 1. picks `batch_size` variates' worth of SKUs (about 8 SKUs at 8 variates),
    uniformly from the round's pool;

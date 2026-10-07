@@ -100,6 +100,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 - ✅ **Retrain vs forecast dates** (`origin_step_days`): one fit per fold, forecasts from every N-th day until the next fold, never reaching the holdout; a `model_age` metrics table; `cutoffs` lists every origin.
 - ✅ **Multi-round fine-tuning** (`fine_tune.rounds`): disjoint stratified draws per round, LoRA merged between rounds, learning rate stepped down across rounds, one full merged checkpoint saved, loss curve and per-round SKUs in the manifest.
 - ✅ **Scalable `finetune`**: a streaming catalog profile (`train_mix.stream_profile`, identical to the in-memory one), then each round loads only its SKUs. Pools above `max_pool_series` without a cap are refused.
+- ✅ **Fixed-window fine-tuning** (`fine_tune.train_window_days`): training targets only from the last W days before each cutoff, with up to `context_length` days of real context. Implemented by truncating to W + C days and setting the trainer's `min_past = C`; young series are front-padded with missing values. Tested against a simulation of the trainer's cut rule.
 - ✅ **`bench`**: seconds per training step, forecast series/s and memory, measured on the machine; estimates hours per fine-tune, backtest and production forecast, and the shard count for a memory budget.
 - ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.

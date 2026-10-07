@@ -45,7 +45,7 @@ from .base import Forecast, Forecaster
 
 DEFAULT_MODEL_ID = "amazon/chronos-2"
 FINE_TUNE_KEYS = frozenset({"num_steps", "learning_rate", "mode", "batch_size", "context_length",
-                            "train_mix", "rounds", "max_pool_series", "log_every"})
+                            "train_mix", "rounds", "max_pool_series", "log_every", "train_window_days"})
 
 # loaded base pipelines keyed by (model_id, device, dtype): the backtest
 # builds a fresh model per fold; reloading the weights each time is waste
@@ -193,6 +193,8 @@ class Chronos2(Forecaster):
                 raise ValueError("chronos2 fine_tune.mode must be 'full' or 'lora'")
             if ft.get("train_mix") is not None:
                 validate_mix(ft["train_mix"])
+            if ft.get("train_window_days") is not None and int(ft["train_window_days"]) < 1:
+                raise ValueError("chronos2 fine_tune.train_window_days must be >= 1 (or omitted)")
             rounds = int(ft.get("rounds", 1))
             if rounds < 1:
                 raise ValueError("chronos2 fine_tune.rounds must be >= 1")
@@ -408,6 +410,10 @@ class Chronos2(Forecaster):
         mode = ft.get("mode", "full")
         max_ctx = int(ft.get("context_length") or self.params.get("context_length") or 0)
         source = rounds_source or self.memory_rounds(history, project)
+        window = int(ft["train_window_days"]) if ft.get("train_window_days") else None
+        if window is not None and window < project.horizon:
+            raise ValueError(f"fine_tune.train_window_days ({window}) must be >= horizon ({project.horizon})")
+        win_ctx = max_ctx or int(getattr(self.pipe, "model_context_length", 0) or 2048)
         n_all = int(history[SERIES].nunique()) if history is not None else None
 
         used: set[str] = set()
@@ -430,6 +436,8 @@ class Chronos2(Forecaster):
             # full series: the trainer samples windows across the whole history
             # and crops each window's context to `context_length` itself
             inputs = [self._input(ctx, i, None, 0) for i in range(len(ctx["sids"]))]
+            if window is not None:
+                inputs = [fixed_window(d, window, win_ctx, project.horizon) for d in inputs]
             known, past = self._covariates(hist_k, project)
             data_hash += history_hash(hist_k, known, past)
             start = hist_k[TS].min()
@@ -440,6 +448,8 @@ class Chronos2(Forecaster):
             stage = Path(out_dir) / f".round-{k}"
             t0 = time.perf_counter()
             extra = {} if rounds == 1 else {"lr_scheduler_type": "constant"}
+            if window is not None:
+                extra["min_past"] = win_ctx  # cut points only inside the window (see fixed_window)
             self.pipe = self.pipe.fit(
                 inputs,
                 prediction_length=project.horizon,
@@ -479,6 +489,7 @@ class Chronos2(Forecaster):
                  "total_steps": per_round * len(round_facts),
                  "train_seconds": round(time.perf_counter() - t_all, 1),
                  "data_hash": data_hash, "train_start": str(pd.Timestamp(train_start).date()),
+                 "train_window_days": window,
                  "loss_curve": _thin(curve, 200)}
         if len(round_facts) == 1 and round_facts[0]["mix"] is not None:
             facts["train_mix"] = round_facts[0]["mix"]  # back-compatible single-round report
@@ -551,6 +562,40 @@ class Chronos2(Forecaster):
         out = np.sort(out, axis=1)
         qd = {w: out[:, j] for j, w in enumerate(wanted)}
         return qd[0.5], {q: qd[q] for q in project.quantiles}
+
+
+def fixed_window(d: dict, window: int, context: int, horizon: int) -> dict:
+    """Shape one training series so the trainer's targets all come from its
+    last `window` days, each with up to `context` days of real history before
+    it, matching inference: a fixed window, not the whole (expanding) history.
+
+    The trainer cuts each series at a uniform point in [min_past, len - H]
+    and uses the `context` days before the cut. With min_past = context, we
+    keep the last window + context days and left-pad with missing values so
+    the earliest allowed cut sits at max(H, len - window) in real days:
+    targets never start before the window, and young series (shorter than
+    window + context) still train from day H, their missing context padded
+    exactly as Chronos-2 pads short contexts at inference."""
+    y = d["target"]
+    L_full = len(y)
+    keep = min(L_full, window + context)
+    s = L_full - keep
+    m = max(horizon, keep - window)          # earliest cut, in real days
+    pad = max(0, context - m)
+
+    def cut(a):
+        a = a[s:]
+        if not pad:
+            return a
+        fill = np.full(pad, "" if a.dtype.kind in "UO" else np.nan,
+                       dtype=a.dtype if a.dtype.kind in "UO" else np.float32)
+        return np.concatenate([fill, a])
+
+    out = dict(d)
+    out["target"] = cut(y)
+    if "past_covariates" in d:
+        out["past_covariates"] = {c: cut(np.asarray(v)) for c, v in d["past_covariates"].items()}
+    return out
 
 
 def _loss_recorder(curve: list, offset: int):
