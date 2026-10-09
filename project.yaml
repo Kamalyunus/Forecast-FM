@@ -2,7 +2,7 @@
 # daily ecommerce demand, ~4 years, ~700k series.
 #
 # Every TODO is a placeholder for your data (WP1). Check what the code will
-# actually use with:   python -m forecast_fm config [--profile full] [--check-data]
+# actually use with:   python -m forecast_fm [--profile full] config [--check-data]
 #
 # How this file is read (see forecast_fm/config.py):
 #   extends: base.yaml      start from another file and override it
@@ -60,6 +60,9 @@ covariates:
   # STATIC: one value per series. Chronos-2 uses them for `group_by`
   # cross-learning; `slice_cols` below breaks metrics down by them.
   static_cols: [category, brand]           # TODO
+  # Compute the label from history BEFORE the first validation cutoff (`cutoffs`
+  # lists it): it picks the fine-tuning series and the sample strata, so a label
+  # computed over the backtest years would leak. Unset = classes computed <= first cutoff.
   demand_label_col: demand_label           # TODO: intermittent / seasonal / BAU / event / promo
   covariate_types: {promo_type: categorical}   # pin numeric | categorical where inference is wrong
   # days with no raw row: ffill | zero | nan (default: known -> ffill, past -> nan)

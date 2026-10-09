@@ -37,10 +37,11 @@ from .plans import future_frame
 
 
 def _peak_rss_mb() -> float:
+    """Process high-water mark so far (bytes on macOS, KiB on Linux)."""
     import resource
 
     r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return r / 2**20 if sys.platform == "darwin" else r / 1024  # bytes on macOS, KiB on Linux
+    return r / 2**20 if sys.platform == "darwin" else r / 1024
 
 
 def bench(project: ProjectConfig, exp: ExperimentConfig, data=None, n_series: int = 2000,
@@ -51,17 +52,19 @@ def bench(project: ProjectConfig, exp: ExperimentConfig, data=None, n_series: in
     params = project.model_params(exp.model, exp.model_params)
     if exp.model != "chronos2":
         raise ValueError("bench measures the chronos2 model; give a chronos2 config")
+    rss0 = _peak_rss_mb()  # before anything streams the catalog
     first, last, all_ids = date_span(project, data, with_series=True)
     rng = np.random.default_rng(seed)
     pick = set(rng.choice(sorted(all_ids), size=min(n_series, len(all_ids)), replace=False))
     catalog = catalog or len(all_ids)
 
-    rss0 = _peak_rss_mb()
     t0 = time.perf_counter()
     panel = load_panel(project, data, series=pick)
     load_s = time.perf_counter() - t0
     n = int(panel[SERIES].nunique())
-    rss_panel = _peak_rss_mb() - rss0
+    # measured bytes, not an RSS delta: ru_maxrss is a lifetime high-water mark
+    # that an earlier streaming pass may already have pushed above the panel
+    panel_mb = float(panel.memory_usage(deep=True).sum()) / 2**20
 
     # forecasting: zero-shot; covariate values do not change the cost
     zs = {k: v for k, v in params.items() if k != "fine_tune"}
@@ -76,15 +79,16 @@ def bench(project: ProjectConfig, exp: ExperimentConfig, data=None, n_series: in
     model.predict(panel, fut, flat)
     predict_s = time.perf_counter() - t0
     sps = n / predict_s if predict_s else float("inf")
-    rss_after = _peak_rss_mb() - rss0
+    rss_after = _peak_rss_mb() - rss0  # everything beyond the start: streaming, model, inputs
     out: dict = {
         "machine": describe(), "series_measured": n, "catalog_series": catalog,
         "data_load_seconds": round(load_s, 2), "model_load_seconds": round(model_load_s, 2),
         "forecast": {"series_per_second": round(sps, 1), "seconds": round(predict_s, 2),
                      "variates_per_series": model.stats.get("n_variates"),
                      "accelerator_memory_mb": model.stats.get("accel_memory_mb")},
-        "memory": {"panel_mb_per_series": round(rss_panel / max(n, 1), 4),
-                   "fixed_mb": round(max(rss_after - rss_panel, 0), 1)},
+        # x2: the forecast holds working copies (history slice, future frame, inputs)
+        "memory": {"panel_mb_per_series": round(2 * panel_mb / max(n, 1), 4),
+                   "fixed_mb": round(max(rss_after - panel_mb, 0), 1)},
     }
 
     ft = params.get("fine_tune")

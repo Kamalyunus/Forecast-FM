@@ -10,6 +10,7 @@ at ~700k series x ~1460 days.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -24,13 +25,31 @@ STOCKOUT = "stockout"
 ID_SEP = "|"
 
 
+def _id_text(col: pd.Series) -> pd.Series:
+    """Ids as text. An integer id column that a csv reader turned into floats
+    (one null makes 123 -> 123.0) is restored, so plan and new-SKU files match
+    the history."""
+    if pd.api.types.is_float_dtype(col):
+        v = col.dropna()
+        if len(v) and (v == np.floor(v)).all():
+            return col.astype("Int64").astype(str)
+    return col.astype(str)
+
+
 def make_series_id(df: pd.DataFrame, id_cols: list[str]) -> pd.Series:
-    if len(id_cols) == 1:
-        return df[id_cols[0]].astype(str)
-    out = df[id_cols[0]].astype(str)
+    out = _id_text(df[id_cols[0]])
     for c in id_cols[1:]:
-        out = out + ID_SEP + df[c].astype(str)
+        out = out + ID_SEP + _id_text(df[c])
     return out
+
+
+def naive_dates(col: pd.Series) -> pd.Series:
+    """Dates at midnight, timezone dropped: a UTC-stamped export must compare
+    with the plain dates in project.yaml and the plan files."""
+    out = pd.to_datetime(col)
+    if getattr(out.dt, "tz", None) is not None:
+        out = out.dt.tz_localize(None)
+    return out.dt.normalize()
 
 
 def _expand(path: str | Path | list) -> list[Path]:
@@ -177,7 +196,9 @@ def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data",
         out[STOCKOUT] = False
     out[SERIES] = make_series_id(out, project.series_id_cols)
     out = out.rename(columns={project.timestamp_col: TS, project.target_col: Y})
-    out[TS] = pd.to_datetime(out[TS]).dt.normalize()
+    out[TS] = naive_dates(out[TS])
+    if out[TS].isna().any():
+        raise ValueError(f"{source}: {int(out[TS].isna().sum()):,} rows have no {project.timestamp_col}")
     if project.start_date:
         out = out[out[TS] >= pd.Timestamp(project.start_date)]
     if project.end_date:
@@ -195,6 +216,15 @@ def prepare_raw(df: pd.DataFrame, project: ProjectConfig, source: str = "data",
         elif project.negative_target == "nan":
             y = y.where(y >= 0)
     out[Y] = y
+    for c in project.covariate_cols:
+        if c in out.columns and project.covariate_types.get(c) is None and out[c].dtype == object:
+            num = pd.to_numeric(out[c], errors="coerce")
+            bad = num.isna() & out[c].notna()
+            if num.notna().sum() and bad.mean() <= 0.01 and bad.any():
+                warnings.warn(f"{source}: {c} is numeric except for {int(bad.sum()):,} value(s) such as "
+                              f"{out.loc[bad, c].iloc[0]!r}; they become missing (pin covariate_types"
+                              f" to override)", stacklevel=2)
+                out[c] = num
     return _dedupe(out, project)
 
 
@@ -305,10 +335,16 @@ def build_panel(raw: pd.DataFrame, project: ProjectConfig, end: pd.Timestamp | N
 
     statics = [c for c in dict.fromkeys([*project.static_cols, project.demand_label_col]) if c]
     if statics:
-        first = raw.sort_values(TS).drop_duplicates(SERIES).set_index(SERIES)[statics]
-        first = first.reindex(sid.cat.categories)
+        # the first row of each series (no full sort or copy of the raw frame);
+        # a missing static is the "" token, like a missing categorical covariate
+        scodes = sid.cat.codes.to_numpy()   # (`codes` was reused for the categoricals above)
+        order = np.lexsort((day, scodes))  # by series, then day: positional, so a
+        oc = scodes[order]                 # non-unique raw index cannot duplicate rows
+        first_pos = order[np.concatenate([[True], oc[1:] != oc[:-1]])]
+        first = raw.iloc[first_pos].set_index(SERIES)[statics].reindex(sid.cat.categories)
         for c in statics:
-            panel[c] = pd.Categorical(first[c].astype(str).to_numpy()[out_codes])
+            vals = first[c].astype("string").fillna("").to_numpy(dtype=str)
+            panel[c] = pd.Categorical(vals[out_codes])
 
     got, want = float(np.nansum(panel[Y].to_numpy(np.float64))), float(raw[Y].sum())
     if not np.isclose(got, want, rtol=1e-6, atol=1e-3):
@@ -355,8 +391,8 @@ def demand_classes(panel: pd.DataFrame, project: ProjectConfig, end: pd.Timestam
     Syntetos-Boylan classes (smooth, erratic, intermittent, lumpy) from
     ADI and CV^2 of non-zero demand, using data <= `end` only."""
     if project.demand_label_col:
-        lab = panel.drop_duplicates(SERIES).set_index(SERIES)[project.demand_label_col]
-        return lab.astype(str).rename("demand_class")
+        lab = panel.drop_duplicates(SERIES).set_index(SERIES)[project.demand_label_col].astype(str)
+        return lab.where(lab != "", "unlabeled").rename("demand_class")  # a missing label is not "no history"
     p = panel if end is None else panel[panel[TS] <= end]
     p = p[~p[STOCKOUT]]
     g = p.groupby(SERIES, observed=True)[Y]

@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from forecast_fm.config import load_project  # noqa: E402
 from forecast_fm.folds import fold_cutoffs  # noqa: E402
 
-OUT = Path("data/demo")
+ROOT = Path(__file__).resolve().parents[1]  # run from anywhere; paths are the repo's
+OUT = ROOT / "data" / "demo"
 
 
 START = "2022-01-01"
@@ -97,7 +98,7 @@ def plans(panel: pd.DataFrame, cutoffs: list[pd.Timestamp], horizon: int, seed: 
 
 if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
-    project = load_project("examples/demo_project.yaml")
+    project = load_project(ROOT / "examples" / "demo_project.yaml")
     raw, full = make()
     # from the grid start, not the first sale: the last plan snapshot must cover
     # the full 90 days after `last`, like a real production plan

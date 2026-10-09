@@ -8,6 +8,4 @@ venv/
 .DS_Store
 data/
 reports/
-!data/.gitkeep
-!reports/.gitkeep
 models/

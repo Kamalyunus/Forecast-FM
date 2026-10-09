@@ -52,7 +52,7 @@ float64 tensors on MPS, and no CUDA-only calls without a device check.
 
 ```bash
 pytest                         # before and after every change
-ruff check forecast_fm tests   # lint
+ruff check forecast_fm tests examples   # lint
 python -m forecast_fm env      # device / versions
 ```
 

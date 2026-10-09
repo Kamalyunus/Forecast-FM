@@ -21,6 +21,8 @@ def fold_cutoffs(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig
     folds, not 1.
     """
     last, first = pd.Timestamp(last), pd.Timestamp(first)
+    if holdout and not project.holdout_cutoffs and not project.holdout_folds:
+        return []  # no holdout configured
     explicit = project.holdout_cutoffs if holdout else project.cutoffs
     if explicit:
         cutoffs = sorted(pd.Timestamp(c) for c in explicit)
@@ -28,10 +30,16 @@ def fold_cutoffs(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig
         if late:
             raise ValueError(f"cutoffs {[str(c.date()) for c in late]}: horizon runs past the "
                              f"last date {last.date()}")
-        if not holdout and project.holdout_cutoffs:
-            first_hold = min(pd.Timestamp(c) for c in project.holdout_cutoffs)
-            if max(cutoffs) + pd.Timedelta(days=project.horizon) > first_hold:
-                raise ValueError("validation cutoffs' horizons overlap the first holdout cutoff")
+        if not holdout and (project.holdout_cutoffs or project.holdout_folds):
+            # explicit or rule-based, the holdout window is off limits to validation
+            try:
+                first_hold = min(fold_cutoffs(first, last, project, holdout=True))
+            except ValueError:
+                first_hold = None  # no holdout fits the history: nothing to protect
+            if first_hold is not None and max(cutoffs) + pd.Timedelta(days=project.horizon) > first_hold:
+                raise ValueError(f"validation cutoff {max(cutoffs).date()} + horizon overlaps the holdout "
+                                 f"window starting {first_hold.date()}: move it earlier, or set "
+                                 "holdout_cutoffs explicitly")
         return cutoffs
     if holdout:
         idx = range(project.holdout_folds)
@@ -81,5 +89,8 @@ def fold_origins(cutoffs: list[pd.Timestamp], project: ProjectConfig,
         while (nxt is None or o < nxt) and o + H <= limit:
             origins.append(o)
             o = o + pd.Timedelta(days=step)
-        out.append(origins or [c])
+        if not origins:
+            raise ValueError(f"fold cutoff {c.date()} + horizon passes {limit.date()}, the first holdout "
+                             "cutoff: validation may not score the holdout window")
+        out.append(origins)
     return out

@@ -127,5 +127,9 @@ def test_cold_start_methods_zero_and_none():
     cutoff = pd.Timestamp("2024-03-10")
     z, _ = forecast_at(panel, cutoff, _project(cold_start={"method": "zero"}), make_exp(), None)
     assert (z.loc[z["lifecycle"] == "new", "y_pred"] == 0).all()
-    n, _ = forecast_at(panel, cutoff, _project(cold_start={"method": "none"}), make_exp(), None)
-    assert (n["lifecycle"] == "established").all()
+    n, st = forecast_at(panel, cutoff, _project(cold_start={"method": "none"}), make_exp(), None)
+    # `none` still returns the new series, as missing forecasts: scored as gaps, never dropped
+    new_rows = n[n["lifecycle"] == "new"]
+    assert len(new_rows) == len(z[z["lifecycle"] == "new"]) and new_rows["y_pred"].isna().all()
+    assert st["n_missing_forecast"] == new_rows[SERIES].nunique()
+    assert n.loc[n["lifecycle"] == "established", "y_pred"].notna().all()

@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,7 @@ FINE_TUNE_KEYS = frozenset({"num_steps", "learning_rate", "mode", "batch_size", 
 # loaded base pipelines keyed by (model_id, device, dtype): the backtest
 # builds a fresh model per fold; reloading the weights each time is waste
 _PIPELINES: dict[tuple[str, str, str], object] = {}
+_WARNED: dict[str, bool] = {}  # once-per-process warnings
 
 
 def _chronos():
@@ -168,8 +170,15 @@ class Chronos2(Forecaster):
     group_by        static cols; series sharing values are forecast jointly
                     with cross-learning ([] = independent series)
     group_size      max series per cross-learning group (100)
-    fine_tune       {num_steps, learning_rate, mode: full|lora, batch_size,
-                    context_length}; omitted = zero-shot
+    fine_tune       omitted = zero-shot. Keys (defaults):
+                      mode: full | lora (full)   num_steps (1000)
+                      learning_rate (1e-6)       batch_size: variates per step (256)
+                      context_length (the model_params value, else the model's limit)
+                      train_window_days (none: whole history)
+                      rounds (1; > 1 needs train_mix.max_series)
+                      train_mix {classes, max_share, min_nonzero_days,
+                                 lookback_days (365), max_series, seed}
+                      max_pool_series (200000)   log_every (num_steps/rounds/50)
     cache_dir       fine-tuned checkpoint cache ("reports/chronos2_ft")
     allow_unverified_checkpoint
                     load fine-tuned weights that have no forecast_fm manifest
@@ -255,7 +264,9 @@ class Chronos2(Forecaster):
 
     def _future_arrays(self, ctx: dict, future: pd.DataFrame, H: int) -> dict[str, np.ndarray]:
         """(n_series, H) per known covariate, rows aligned to ctx['sids'].
-        Absent cells: NaN (numeric) or "" (categorical)."""
+        Absent or missing cells: NaN (numeric) or "" (categorical), the same
+        missing token the history uses, so an uncovered plan day is never a
+        new category ("nan")."""
         rows = ctx["sids"].get_indexer(future[SERIES])
         hz = future[HORIZON].to_numpy(dtype=np.int64) - 1
         ok = (rows >= 0) & (hz >= 0) & (hz < H)
@@ -263,7 +274,8 @@ class Chronos2(Forecaster):
         for c in ctx["known"]:
             if c in ctx["cats"]:
                 mat = np.full((len(ctx["sids"]), H), "", dtype=object)
-                vals = future[c].astype(str).to_numpy()
+                col = future[c]
+                vals = np.where(col.isna().to_numpy(), "", col.astype(object).astype(str).to_numpy())
             else:
                 mat = np.full((len(ctx["sids"]), H), np.nan, dtype=np.float32)
                 vals = future[c].to_numpy(dtype=np.float32)
@@ -326,13 +338,22 @@ class Chronos2(Forecaster):
             "base_manifest": read_manifest(model_id),
             "dtype": self.params.get("dtype", "float32"),
             "context_length": self.params.get("context_length"),
-            "fine_tune": self.params["fine_tune"],
+            # settings that change the trained weights only (not log_every, max_pool_series)
+            "fine_tune": {k: v for k, v in self.params["fine_tune"].items()
+                          if k not in ("log_every", "max_pool_series")},
             "known": known, "past": past, "horizon": project.horizon,
             "policy": project.covariate_eval_policy,
             "cutoff": str(pd.Timestamp(cutoff).date()),
             "n_series": int(history[SERIES].nunique()), "data_hash": history_hash(history, known, past),
             "code": code_fingerprint(),
         }
+        if self.params["fine_tune"].get("train_mix"):
+            # the selection reads the demand classes: relabelled SKUs = a different training set
+            from ..data import demand_classes
+
+            cls = demand_classes(history, project).astype(str).sort_index()
+            payload["classes"] = (project.demand_label_col,
+                                  int(pd.util.hash_pandas_object(cls, index=True).sum()))
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
     def _load(self, cutoff: pd.Timestamp) -> None:
@@ -375,7 +396,8 @@ class Chronos2(Forecaster):
                                  "fine_tune.train_mix.max_series and fine_tune.rounds")
 
             def everything(k, used):
-                return (history, pd.Index(history[SERIES].astype(str).unique()), None) if k == 0 else None
+                ids = pd.Index(np.asarray(history[SERIES].unique()).astype(str))
+                return (history, ids, None) if k == 0 else None
             return everything
         prof = profile(history, project, int(mix.get("lookback_days", 365)))
 
@@ -384,7 +406,7 @@ class Chronos2(Forecaster):
                                               max_pool_series=limit)
             if not len(ids):
                 return None
-            return history[history[SERIES].astype(str).isin(set(ids))], ids, report
+            return history[history[SERIES].isin(set(map(str, ids)))], ids, report
         return draw
 
     def train(self, history: pd.DataFrame | None, project: ProjectConfig, out_dir: Path,
@@ -413,7 +435,7 @@ class Chronos2(Forecaster):
         window = int(ft["train_window_days"]) if ft.get("train_window_days") else None
         if window is not None and window < project.horizon:
             raise ValueError(f"fine_tune.train_window_days ({window}) must be >= horizon ({project.horizon})")
-        win_ctx = max_ctx or int(getattr(self.pipe, "model_context_length", 0) or 2048)
+        model_ctx = int(getattr(self.pipe, "model_context_length", 0) or 2048)
         n_all = int(history[SERIES].nunique()) if history is not None else None
 
         used: set[str] = set()
@@ -436,6 +458,9 @@ class Chronos2(Forecaster):
             # full series: the trainer samples windows across the whole history
             # and crops each window's context to `context_length` itself
             inputs = [self._input(ctx, i, None, 0) for i in range(len(ctx["sids"]))]
+            # the window's context: context_length, else the longest real history in
+            # the round (never the model's 8k limit, which would pad every series to it)
+            win_ctx = max_ctx or min(model_ctx, int(lengths.max()))
             if window is not None:
                 inputs = [fixed_window(d, window, win_ctx, project.horizon) for d in inputs]
             known, past = self._covariates(hist_k, project)
@@ -479,6 +504,7 @@ class Chronos2(Forecaster):
                                 "mix": report})
             print(f"[chronos2] round {k + 1}/{rounds}: {len(ids):,} series, {per_round} steps, "
                   f"lr {lr_k:.2e}, {round_facts[-1]['seconds']}s"
+                  + (f", window {window}d + context {win_ctx}d" if window is not None else "")
                   + (f", loss {losses[0]:.4f} -> {losses[-1]:.4f}" if losses else ""))
         if not round_facts:
             raise ValueError("fine-tuning drew no series")
@@ -502,10 +528,12 @@ class Chronos2(Forecaster):
         ft = self.params.get("fine_tune")
         if ft is None:
             return
+        import shutil
+
         key = self._ft_key(history, project, cutoff)
         out_dir = Path(self.params.get("cache_dir", "reports/chronos2_ft")) / key
         ckpt = out_dir / CKPT
-        if ckpt.exists():
+        if (out_dir / MANIFEST).exists() and ckpt.exists():  # the manifest is written last
             print(f"[chronos2] fine-tune cache hit {key} (cutoff {pd.Timestamp(cutoff).date()})")
             self.pipe = _place(_chronos().from_pretrained(str(ckpt)), self.device, self.dtype)
             self.stats["fine_tune_cache"] = "hit"
@@ -513,15 +541,21 @@ class Chronos2(Forecaster):
             if meta.exists() and "train_mix" in (saved := json.loads(meta.read_text())):
                 self.stats["train_mix"] = saved["train_mix"]
             return
-        facts = self.train(history, project, out_dir)
+        # train into a staging dir and rename when complete: a crash mid-save
+        # leaves no directory that the next run could mistake for a checkpoint
+        stage = out_dir.with_name(out_dir.name + ".partial")
+        for d in (stage, out_dir):
+            shutil.rmtree(d, ignore_errors=True)
+        facts = self.train(history, project, stage)
         meta = {"cutoff": str(pd.Timestamp(cutoff).date()), "fine_tune": ft}
         if "train_mix" in facts:
             meta["train_mix"] = self.stats["train_mix"] = facts["train_mix"]
-        (out_dir / "key.json").write_text(json.dumps(meta, indent=2, default=str))
+        (stage / "key.json").write_text(json.dumps(meta, indent=2, default=str))
         # the guard reads this: a cached fold checkpoint can never be reused
         # at an earlier cutoff, whoever points model_id at it
-        (out_dir / MANIFEST).write_text(json.dumps(
+        (stage / MANIFEST).write_text(json.dumps(
             {"train_end": meta["cutoff"], "kind": "backtest_cache", "fine_tune": ft}, default=str))
+        stage.rename(out_dir)
         self.stats.update(fine_tune_cache="miss", fine_tune_seconds=facts["train_seconds"])
 
     def predict(self, history: pd.DataFrame, future: pd.DataFrame, project: ProjectConfig) -> Forecast:
@@ -531,6 +565,13 @@ class Chronos2(Forecaster):
         fut = self._future_arrays(ctx, future, H) if ctx["known"] else None
         levels = list(self.pipe.quantiles)
         wanted = sorted(set(project.quantiles) | {0.5})
+        outside = [q for q in wanted if q < min(levels) - 1e-9 or q > max(levels) + 1e-9]
+        if outside and not _WARNED.get("clamp"):
+            _WARNED["clamp"] = True
+            warnings.warn(f"the model predicts quantiles {min(levels)}..{max(levels)} only; "
+                          f"{outside} are clamped to the nearest one (q_{outside[-1]:g} is really the "
+                          f"{max(levels)} quantile). Check the coverage table before trusting them.",
+                          stacklevel=2)
         n_var = 1 + len(ctx["known"]) + len(ctx["past"])
         batch = int(self.params.get("batch_size", 256))
         max_ctx = int(self.params.get("context_length") or 0)
@@ -550,9 +591,18 @@ class Chronos2(Forecaster):
             cube[idx] = interp_quantiles(levels, q.transpose(0, 2, 1), wanted)
         secs = time.perf_counter() - t0
         empty_cache(self.device)
+        # a series whose last row lies a whole context before the cutoff would be
+        # forecast from an all-missing context (grid_end: series, discontinued SKUs):
+        # that is no forecast, so it is reported as missing, not as a number
+        limit = max_ctx or int(getattr(self.pipe, "model_context_length", 0) or 0)
+        n_stale = 0
+        if limit:
+            stale = ctx["gap"] >= limit
+            n_stale = int(stale.sum())
+            cube[stale] = np.nan
         self.stats.update(n_series=len(ctx["sids"]), n_variates=n_var, predict_seconds=round(secs, 2),
                           series_per_second=round(len(ctx["sids"]) / secs, 1) if secs else None,
-                          accel_memory_mb=peak_memory_mb(self.device))
+                          accel_memory_mb=peak_memory_mb(self.device), n_no_context=n_stale)
 
         rows = ctx["sids"].get_indexer(future[SERIES])
         hz = future[HORIZON].to_numpy(dtype=np.int64) - 1
@@ -621,7 +671,8 @@ def _thin(curve: list, n: int) -> list:
 
 
 def history_hash(history: pd.DataFrame, known: list[str], past: list[str]) -> int:
-    """Order-sensitive fingerprint of exactly the data a model trains on."""
+    """Fingerprint of exactly the data a model trains on (a sum of row hashes:
+    the same rows in another order give the same value)."""
     cols = [SERIES, TS, Y, STOCKOUT, *known, *past]
     return int(pd.util.hash_pandas_object(history[cols], index=False).sum())
 

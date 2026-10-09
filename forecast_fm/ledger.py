@@ -25,37 +25,66 @@ HEADER = ("| id | model | hypothesis | based_on | primary | value | Δ vs ref | 
           "|---|---|---|---|---|---|---|---|\n")
 
 
-def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True, check=False).stdout.strip()
+def _git(*args: str, check: bool = False) -> str:
+    r = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {args[0]} failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def in_git_repo() -> bool:
+    return _git("rev-parse", "--is-inside-work-tree") == "true"
 
 
 def code_state(project_file: str | Path = "project.yaml") -> dict:
     """Commit, and whether the package or the project file actually used has
-    uncommitted changes."""
-    return {"commit": _git("rev-parse", "--short", "HEAD") or None,
-            "dirty_code": bool(_git("status", "--porcelain", "--", "forecast_fm", str(project_file)))}
+    uncommitted changes. Outside a git checkout: no commit, nothing dirty,
+    `in_repo` False (a ledgered run refuses; a debug run proceeds)."""
+    if not in_git_repo():
+        return {"commit": None, "dirty_code": False, "in_repo": False}
+    return {"commit": _git("rev-parse", "--short", "HEAD") or None, "in_repo": True,
+            "dirty_code": bool(_git("status", "--porcelain", "--", "forecast_fm", str(project_file),
+                                    check=True))}
 
 
 def require_clean(project_file: str | Path) -> None:
     """Called BEFORE a ledgered run starts, not after hours of backtest."""
-    if code_state(project_file)["dirty_code"]:
+    state = code_state(project_file)
+    if not state["in_repo"]:
+        raise RuntimeError("not inside a git checkout: a ledgered run needs git to record the code "
+                           "state (run from the repository root, or use --no-commit)")
+    if state["dirty_code"]:
         raise RuntimeError(f"uncommitted changes in forecast_fm/ or {project_file}: commit them first "
                            "so the run is reproducible (or use --no-commit)")
 
 
 # settings that do not change what is measured: excluded from the signature
+# (warning thresholds and the class label only change tables and messages,
+# never the primary metric)
 _NOT_EVAL = {"name", "model_defaults", "reports_dir", "models_dir", "success_criteria",
-             "verdict_threshold", "slice_cols", "primary_metric"}
+             "verdict_threshold", "slice_cols", "primary_metric", "min_plan_coverage",
+             "plan_max_age_days", "demand_label_col"}
 
 
-def eval_signature(project: ProjectConfig, cutoffs: list) -> str:
+def eval_signature(project: ProjectConfig, cutoffs: list, origins: list | None = None,
+                   data=None) -> str:
     """Two runs are comparable only if data, filters, covariate policy,
-    horizon, quantiles and cutoffs are identical."""
+    horizon, quantiles, cutoffs and forecast origins are identical. `data`:
+    a --data override of the project's data_path; `origins`: per-fold
+    forecast origins (more data can add origins to the same cutoffs)."""
     import hashlib
 
     d = {k: v for k, v in project.to_dict().items() if k not in _NOT_EVAL}
     d["_cutoffs"] = [str(pd.Timestamp(c).date()) for c in cutoffs]
+    if origins:
+        d["_origins"] = [[str(pd.Timestamp(o).date()) for o in fold] for fold in origins]
+    if data is not None:
+        d["_data"] = [str(x) for x in data] if isinstance(data, (list, tuple)) else str(data)
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _slug(exp: ExperimentConfig) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", exp.name.lower()).strip("-")[:40]
 
 
 def next_id() -> str:
@@ -63,15 +92,42 @@ def next_id() -> str:
     return f"exp{max(ids, default=0) + 1:03d}"
 
 
+RUNNING = ".running"
+
+
+def reserve(exp: ExperimentConfig) -> Path:
+    """Claim the next id BEFORE the backtest, so two runs finishing in any
+    order never share an id or overwrite each other's artifacts."""
+    EXP_DIR.mkdir(parents=True, exist_ok=True)
+    out = EXP_DIR / f"{next_id()}-{_slug(exp)}"
+    out.mkdir(exist_ok=False)
+    (out / RUNNING).write_text(str(pd.Timestamp.now()))
+    return out
+
+
+def release(out: Path) -> None:
+    """Undo a reservation whose run failed (only the marker is inside)."""
+    out = Path(out)
+    if out.is_dir() and {p.name for p in out.iterdir()} <= {RUNNING}:
+        for p in out.iterdir():
+            p.unlink()
+        out.rmdir()
+
+
+def _exp_dirs(exp_id: str) -> list[Path]:
+    """exp001 matches exp001-<slug> and exp001, never exp0010-..."""
+    return sorted(p for p in EXP_DIR.glob(f"{exp_id}*") if re.fullmatch(rf"{exp_id}(-.*)?", p.name))
+
+
 def load_metrics(exp_id: str) -> dict:
-    matches = sorted(EXP_DIR.glob(f"{exp_id}*/metrics.json"))
+    matches = [p / "metrics.json" for p in _exp_dirs(exp_id) if (p / "metrics.json").is_file()]
     if not matches:
         raise FileNotFoundError(f"no ledgered experiment {exp_id!r} under {EXP_DIR}/")
     return json.loads(matches[0].read_text())
 
 
 def has_experiment(exp_id: str) -> bool:
-    return any(EXP_DIR.glob(f"{exp_id}*/metrics.json"))
+    return any((p / "metrics.json").is_file() for p in _exp_dirs(exp_id))
 
 
 def check_reference(exp: ExperimentConfig, commit: bool) -> None:
@@ -102,7 +158,11 @@ def verdict(metrics: dict, ref: dict | None, project: ProjectConfig) -> tuple[st
     rel = (new - old) / abs(old)
     folds_new = {f["fold"]: f[m] for f in metrics["tables"]["fold"]}
     folds_old = {f["fold"]: f[m] for f in ref["tables"]["fold"]}
-    common = [k for k in folds_new if k in folds_old]
+    # a fold without a finite value on either side says nothing: it is not "worse"
+    common = [k for k in folds_new if k in folds_old
+              and pd.notna(folds_new[k]) and pd.notna(folds_old[k])]
+    if not common:
+        return "inconclusive", rel
     better = sum(folds_new[k] < folds_old[k] for k in common)
     if rel < -project.verdict_threshold and better > len(common) / 2:
         return "improved", rel
@@ -112,20 +172,18 @@ def verdict(metrics: dict, ref: dict | None, project: ProjectConfig) -> tuple[st
 
 
 def record(exp: ExperimentConfig, project: ProjectConfig, result: dict, commit: bool,
-           context: dict | None = None) -> Path:
+           context: dict | None = None, reserved: Path | None = None) -> Path:
     """Write the run's artifacts; with commit=True, ledger it. `context`: how
     the run was invoked (project file, profile, --set, --data, shards,
-    cutoffs); stored with the fully resolved project config."""
+    cutoffs); stored with the fully resolved project config. `reserved`: the
+    directory `reserve` claimed before the run."""
     context = dict(context or {})
     project_file = context.get("project_file", "project.yaml")
     state = code_state(project_file)
     if commit:
-        if state["dirty_code"]:
-            raise RuntimeError(f"uncommitted changes in forecast_fm/ or {project_file}: commit code "
-                               "first so the run is reproducible (or use --no-commit)")
-        exp_id = next_id()
-        slug = re.sub(r"[^a-z0-9]+", "-", exp.name.lower()).strip("-")[:40]
-        out = EXP_DIR / f"{exp_id}-{slug}"
+        require_clean(project_file)
+        out = Path(reserved) if reserved is not None else reserve(exp)
+        exp_id = out.name.split("-")[0]
     else:
         exp_id = "scratch"
         out = Path(project.reports_dir) / "scratch" / re.sub(r"[^a-z0-9]+", "-", exp.name.lower())
@@ -133,7 +191,8 @@ def record(exp: ExperimentConfig, project: ProjectConfig, result: dict, commit: 
 
     ref = load_metrics(exp.based_on) if exp.based_on and (commit or has_experiment(exp.based_on)) else None
     tables = {k: t.to_dict(orient="records") for k, t in result["tables"].items()}
-    signature = eval_signature(project, context.get("cutoffs") or result.get("cutoffs") or [])
+    signature = eval_signature(project, context.get("cutoffs") or result.get("cutoffs") or [],
+                               origins=result.get("origins"), data=context.get("data"))
     v, rel = verdict({"overall": result["overall"], "tables": tables, "eval_signature": signature},
                      ref, project)
     payload = {
@@ -163,8 +222,11 @@ def record(exp: ExperimentConfig, project: ProjectConfig, result: dict, commit: 
             f.write(f"| {exp_id} | {exp.model} | {exp.hypothesis.replace('|', '/')} | "
                     f"{exp.based_on or '—'} | {project.primary_metric} | {shown} | "
                     f"{'—' if rel is None else f'{rel:+.1%}'} | {v} |\n")
-        _git("add", str(out), str(LEDGER))
-        _git("commit", "-m", f"{exp_id} [{v}] {exp.hypothesis}")
+        (out / RUNNING).unlink(missing_ok=True)
+        _git("add", "--", str(out), str(LEDGER), check=True)
+        # only these paths: never sweep whatever else sits in the index into the run's commit
+        _git("commit", "-m", f"{exp_id} [{v}] {exp.hypothesis}", "--", str(out), str(LEDGER), check=True)
+        print(f"[{exp_id}] committed {_git('rev-parse', '--short', 'HEAD')}")
     return out
 
 

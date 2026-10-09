@@ -73,7 +73,8 @@ def run_backtest(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
             print(f"[shard {i + 1}/{shards}] {panel[SERIES].nunique():,} series")
         ids = set(panel[SERIES].astype(str).unique())
         plans = load_plans(project, cutoffs=all_origins, series=ids)
-        preds, st = backtest(panel, project, exp, plans, cutoffs=cutoffs, origins=origins)
+        preds, st = backtest(panel, project, exp, plans, cutoffs=cutoffs, origins=origins,
+                             data_start=first)
         classes = demand_classes(panel, project, end=cutoffs[0])
         parts.append(metrics.partials(preds, project, classes, _statics(panel, project)))
         stats += [{"shard": i, **s} for s in st] if shards > 1 else st
@@ -91,6 +92,26 @@ def run_backtest(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
     result.update(stats=stats, env=describe(), cutoffs=cutoffs, shards=shards,
                   origins=[[str(o.date()) for o in fold] for fold in origins])
     return result, kept
+
+
+def _claim_run(out_dir: Path, shards: int, origin: pd.Timestamp, force: bool) -> None:
+    """Parts are named by shard index, so a directory can only be resumed with
+    the shard count and origin it was started with: otherwise series would be
+    missing or duplicated in a directory that looks complete."""
+    run_file = out_dir / "_run.json"
+    want = {"shards": int(shards), "origin": str(pd.Timestamp(origin).date())}
+    if run_file.exists():
+        have = json.loads(run_file.read_text())
+        if {k: have.get(k) for k in want} == want:
+            return
+        if not force:
+            raise ValueError(f"{out_dir} was started with --shards {have.get('shards')} at origin "
+                             f"{have.get('origin')}; finish it with the same settings, choose another "
+                             f"--out, or pass --force to start over")
+        for f in [*out_dir.glob("part-*.parquet"), *out_dir.glob("_part-*.json"),
+                  out_dir / "_manifest.json"]:
+            f.unlink(missing_ok=True)
+    run_file.write_text(json.dumps(want))
 
 
 def new_series_shard(new: pd.DataFrame, project: ProjectConfig, shards: int) -> np.ndarray:
@@ -126,12 +147,16 @@ def run_forecast(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
     series, including new ones (cold start), as parquet parts in out_dir."""
     panel = load_panel(project, data) if shards == 1 else None
     if shards == 1:
-        origin, known_ids = panel[TS].max(), set(panel[SERIES].astype(str).unique())
+        first, origin, known_ids = panel[TS].min(), panel[TS].max(), set(panel[SERIES].astype(str).unique())
     else:
-        _, origin, known_ids = date_span(project, data, with_series=True)
+        first, origin, known_ids = date_span(project, data, with_series=True)
     out_dir = Path(out_dir or Path(project.reports_dir) / f"forecast_{origin:%Y%m%d}")
     out_dir.mkdir(parents=True, exist_ok=True)
     todo = only if only is not None else list(range(shards))
+    bad = [i for i in todo if not 0 <= i < shards]
+    if bad:
+        raise ValueError(f"--shard {bad} out of range for --shards {shards}")
+    _claim_run(out_dir, shards, origin, force)
     for i in todo:
         part = out_dir / f"part-{i:05d}.parquet"
         if part.exists() and not force:
@@ -159,7 +184,7 @@ def run_forecast(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
             pred, stats = pd.DataFrame(columns=[SERIES, TS, "horizon", "y_pred", LIFECYCLE]), {}
         else:
             pred, stats = forecast_at(panel, origin, project, exp, plans, production=True,
-                                      new_series=new)
+                                      new_series=new, data_start=first)
         pred.insert(0, "origin", origin)
         pred["model"] = exp.name
         pred = _split_ids(pred, project)

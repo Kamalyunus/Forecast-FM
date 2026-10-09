@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 
 from .config import ProjectConfig
-from .data import SERIES, TS, apply_derived, categorical_cols, make_series_id, read_table
+from .data import SERIES, TS, apply_derived, categorical_cols, make_series_id, naive_dates, read_table
 
 AS_OF = "as_of"
 HORIZON = "horizon"
@@ -32,13 +32,16 @@ def _needed_as_of(project: ProjectConfig, cutoffs: list[pd.Timestamp]) -> set[pd
     """The snapshot dates the cutoffs will use (latest as_of <= each cutoff),
     found by streaming only the as_of column."""
     seen: set = set()
+    # the column's name in the file, before plan_columns renames it
+    raw_name = next((k for k, v in project.plan_columns.items() if v == project.plan_as_of_col),
+                    project.plan_as_of_col)
 
     def collect(df: pd.DataFrame) -> np.ndarray:
         col = df.rename(columns=project.plan_columns)[project.plan_as_of_col]
-        seen.update(pd.to_datetime(col).dt.normalize().unique())
+        seen.update(naive_dates(col).unique())
         return np.zeros(len(df), dtype=bool)
 
-    read_table(project.planned_covariates_path, keep=collect)
+    read_table(project.planned_covariates_path, columns=[raw_name], keep=collect)
     dates = sorted(pd.Timestamp(d) for d in seen)
     out = set()
     for c in cutoffs:
@@ -68,7 +71,7 @@ def load_plans(project: ProjectConfig, cutoffs: list[pd.Timestamp] | None = None
             df = df.rename(columns=project.plan_columns)
             m = np.ones(len(df), dtype=bool)
             if wanted is not None:
-                m &= pd.to_datetime(df[project.plan_as_of_col]).dt.normalize().isin(wanted).to_numpy()
+                m &= naive_dates(df[project.plan_as_of_col]).isin(wanted).to_numpy()
             if series is not None:
                 ids = make_series_id(df, project.series_id_cols)
                 # a set of ids, or a function ids -> bool mask (sharding)
@@ -86,8 +89,8 @@ def load_plans(project: ProjectConfig, cutoffs: list[pd.Timestamp] | None = None
                          "plan_timestamp_col, plan_columns)")
     df[SERIES] = make_series_id(df, project.series_id_cols)
     df = df.rename(columns={ts_col: TS, project.plan_as_of_col: AS_OF})
-    df[TS] = pd.to_datetime(df[TS]).dt.normalize()
-    df[AS_OF] = pd.to_datetime(df[AS_OF]).dt.normalize()
+    df[TS] = naive_dates(df[TS])
+    df[AS_OF] = naive_dates(df[AS_OF])
     cols = [c for c in project.known_covariate_cols if c in df.columns]
     df = df[[AS_OF, SERIES, TS, *cols]]
     dup = df.duplicated([AS_OF, SERIES, TS], keep="last")
@@ -149,7 +152,8 @@ def future_frame(history: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectCo
         fut = fut.merge(a, on=[SERIES, TS], how="left")
     if "carry_forward" in by_policy:
         cols = by_policy["carry_forward"]
-        last = history.sort_values(TS).groupby(SERIES, observed=True)[cols].last()
+        last = history[[SERIES, TS, *cols]].sort_values(TS, kind="stable").groupby(
+            SERIES, observed=True)[cols].last()
         fut = fut.merge(last, left_on=SERIES, right_index=True, how="left")
     if "plan" in by_policy:
         cols = by_policy["plan"]
@@ -165,7 +169,7 @@ def future_frame(history: pd.DataFrame, cutoff: pd.Timestamp, project: ProjectCo
             raise ValueError(f"plan snapshots have no column(s) {missing_cols}")
         snap = snap[[SERIES, TS, *cols]]
         # only series being forecast here (new SKUs in the plan are cold start)
-        snap = snap[snap[SERIES].astype(str).isin(set(fut[SERIES].astype(str).unique()))].copy()
+        snap = snap[snap[SERIES].astype(str).isin(set(map(str, sids)))].copy()
         snap[SERIES] = snap[SERIES].astype(str).astype(fut[SERIES].dtype)
         fut = fut.merge(snap, on=[SERIES, TS], how="left")
         coverage = {c: float(fut[c].notna().mean()) for c in cols}

@@ -1,0 +1,22 @@
+name: chronos2-lora-one-round
+hypothesis: "The 07 recipe trained as one draw of 50k SKUs: the reference for the rounds test"
+mechanism: "Same steps, window, mix and learning rate as 07, but every step sees the same 50k SKUs"
+rationale: "Reference for 07 (rounds: 10); differs from it in rounds only"
+model: chronos2
+model_params:
+  context_length: 730
+  fine_tune:
+    mode: lora
+    num_steps: 50000
+    rounds: 1
+    learning_rate: 1.0e-5
+    train_window_days: 730
+    batch_size: 64
+    log_every: 100
+    train_mix:
+      max_series: 50000
+      max_share: {intermittent: 0.25}
+      min_nonzero_days: 4
+      lookback_days: 365
+      seed: 42
+based_on: exp00X             # TODO: the ledgered id of 06c (or the best fine-tune so far)

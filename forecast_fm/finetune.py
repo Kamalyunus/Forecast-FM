@@ -6,7 +6,7 @@ save it as a named checkpoint, and forecast from it until the next retrain.
 
 The output directory holds:
 
-    finetuned-ckpt/        the weights (a LoRA adapter or a full model)
+    finetuned-ckpt/        the weights (one merged model; loads without the base)
     forecast_fm_model.json provenance: base model, recipe, training window,
                            data fingerprint, code commit, environment
     forecast_config.yaml   the recipe with model_id pointing here and
@@ -149,7 +149,7 @@ def finetune(project: ProjectConfig, exp: ExperimentConfig, panel: pd.DataFrame 
     }
     (stage / MANIFEST).write_text(json.dumps(manifest, indent=2, default=str))
 
-    serve = dict(params, model_id=str(out))
+    serve = dict(params, model_id=str(Path(out).resolve()))
     serve.pop("fine_tune", None)
     serve.pop("cache_dir", None)
     forecast_exp = ExperimentConfig(

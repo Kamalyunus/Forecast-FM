@@ -14,4 +14,4 @@ model_params:
       min_nonzero_days: 4
       lookback_days: 365
       seed: 42
-based_on: exp003        # TODO: the ledgered id of 06a
+based_on: exp00X        # TODO: the ledgered id of 06a (see `leaderboard`)

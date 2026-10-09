@@ -26,14 +26,14 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 129 tests (114 run without torch; 15 need the tiny real Chronos-2).
+`pytest`: 145 tests (130 run without torch; 15 need the tiny real Chronos-2).
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
-  - Duplicate (series, date) rows raise an error.
+  - Duplicate (series, date) rows raise an error, or are aggregated per the `duplicates` rule.
   - Target-mass invariant check.
   - Fill rules per covariate (`covariate_fill`).
-  - Stockouts come from `in_stock_col`.
+  - Stockouts come from `in_stock_col` or `stockout_expr` (e.g. `oos_hours >= 12`).
   - Dtypes: series_id and categoricals are `category`; target and covariates are float32.
 - ✅ **Demand classes**: the user's label column; otherwise Syntetos-Boylan (ADI / CV²), computed on data up to the first cutoff.
 - ✅ **Folds** (`folds.py`): validation plus holdout cutoffs, with a gap so validation horizons never overlap the holdout window.
@@ -46,7 +46,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 - ✅ **Backtest** (`backtest.py`):
   - The model gets `history` (<= cutoff) and the future frame (keys + known covariates) only.
   - Targets are joined back for scoring after predict returns.
-- ✅ **Metrics** (`metrics.py`, vectorized): WAPE, bias, MASE (seasonal-naive scale per fold), wQL, and coverage per quantile. Broken down by fold, horizon bucket, demand class, and bucket × class. Stockout days are not scored.
+- ✅ **Metrics** (`metrics.py`, vectorized): WAPE, bias, MASE (seasonal-naive scale computed once per fold at its retrain date), wQL, and coverage per quantile (only over rows that carry quantiles; NaN for a point model). Series the harness owes a forecast but no route produced one are rows with NaN `y_pred`, counted in `n_missing_pred`. Broken down by fold, horizon bucket, demand class, and bucket × class. Stockout days are not scored.
 - ✅ **Models**: `naive`, `seasonal_naive`, `croston` (SBA; the recursion loops over days, vectorized across series), and `chronos2`:
   - Known covariates → history + horizon; past covariates → history only; categoricals → strings; statics → `group_by` cross-learning groups of ≤ `group_size`. Stockouts → NaN in the context.
   - `device: auto` picks CUDA, then MPS, then CPU. `PYTORCH_ENABLE_MPS_FALLBACK=1` is set.
@@ -102,7 +102,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 - ✅ **Scalable `finetune`**: a streaming catalog profile (`train_mix.stream_profile`, identical to the in-memory one), then each round loads only its SKUs. Pools above `max_pool_series` without a cap are refused.
 - ✅ **Fixed-window fine-tuning** (`fine_tune.train_window_days`): training targets only from the last W days before each cutoff, with up to `context_length` days of real context. Implemented by truncating to W + C days and setting the trainer's `min_past = C`; young series are front-padded with missing values. Tested against a simulation of the trainer's cut rule.
 - ✅ **`bench`**: seconds per training step, forecast series/s and memory, measured on the machine; estimates hours per fine-tune, backtest and production forecast, and the shard count for a memory budget.
-- ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, finetune, forecast`.
+- ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, bench, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 
 ## 3. Invariants
@@ -188,7 +188,9 @@ Compute scales with (1 + n_covariates) variates per series. Measure accuracy aga
 
 - 🔲 **`gbt` model family** is not built yet (needed for #2). Build a direct multi-horizon LightGBM with origin-only lag features, and add a leakage test.
 - 🔲 **`router` model family** (needed for #6).
-- Configs for #1, #3, #4 and #5 are in `configs/`.
+- `gbt` (#2) is deferred, so `configs/03` chains zero-shot directly to the seasonal-naive
+  run (#1). Configs for #1, #3, #4, #5, the train-mix study (06a-c) and the rounds test
+  (07 vs its single-round twin 07a) are in `configs/`.
 - Always check `h01-35` against `h36-90`, and the demand-class slices. Watch the intermittent class through its quantiles and coverage.
 
 ### WP8: Ship 🔲

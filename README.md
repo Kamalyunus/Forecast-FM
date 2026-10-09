@@ -31,7 +31,7 @@ The Chronos-2 weights (`amazon/chronos-2`, about 500 MB) download from Hugging
 Face on first use. No internet on the work machine? Copy them once:
 
 ```bash
-huggingface-cli download amazon/chronos-2 --local-dir models/chronos-2
+hf download amazon/chronos-2 --local-dir models/chronos-2      # `hf` ships with huggingface_hub
 # then in project.yaml:  model_defaults: {chronos2: {model_id: models/chronos-2}}
 ```
 
@@ -41,7 +41,7 @@ them, and `<command> --help` explains every flag.
 ## 2. Try it in five minutes (synthetic data)
 
 ```bash
-python examples/make_demo_data.py                      # -> data/demo/ (300 SKUs, 3 years, plans, new SKUs)
+python examples/make_demo_data.py                      # -> data/demo/ (288 SKUs, 3 years, plans, 12 upcoming SKUs)
 export FORECAST_FM_PROJECT=examples/demo_project.yaml  # instead of -p ... on every command
 
 python -m forecast_fm audit                            # what the data looks like -> reports/data_audit.md
@@ -60,30 +60,33 @@ new SKUs included, under `reports/forecast_<date>/`.
 1. **Export the files** described in [`docs/DATA_REQUIREMENTS.md`](docs/DATA_REQUIREMENTS.md):
    sales history (required), plan snapshots (prices and promos as they were
    planned on each forecast date), and optionally upcoming SKUs. Put them under
-   `data/raw/`.
+   `data/raw/`, the full history as `data/raw/sales_full.parquet`. The default
+   `data_path` is the experiment *sample* (step 5); `--profile full` switches
+   every command to the full file.
 2. **Fill in `project.yaml`.** Every `TODO` marks a column or policy that is
    yours to set: column names, which covariates are *known* in advance and
    which are only *observed*, the stockout rule, the service level. The file
    explains each option in place. Check what the code will use:
    ```bash
-   unset FORECAST_FM_PROJECT                 # back to ./project.yaml
-   python -m forecast_fm config --check-data # resolved settings; every declared column present?
+   unset FORECAST_FM_PROJECT                                # back to ./project.yaml
+   python -m forecast_fm --profile full config --check-data # resolved settings; every declared column present?
    ```
 3. **Audit** the data and read the report with whoever owns the data:
    ```bash
-   python -m forecast_fm audit               # -> reports/data_audit.md
+   python -m forecast_fm --profile full audit               # -> reports/data_audit.md
    ```
    Write down what the columns mean in `experiments/DATA_NOTES.md`.
 4. **Get plan snapshots for the backtest dates.** Backtests must only see what
    was known at the time, so each fold needs the plan as it stood on its
-   cutoff. `python -m forecast_fm cutoffs` lists the dates.
+   cutoff. `python -m forecast_fm --profile full cutoffs` lists the dates.
 5. **Draw the experiment sample** from the full catalog (experiments run on
    20–50k series, the final forecast on everything):
    ```bash
-   python -m forecast_fm sample --src data/raw/sales_full.parquet --n 30000 \
-       --by demand_label --until <first cutoff>   # -> data/raw/sales_sample.parquet + manifest
+   python -m forecast_fm --profile full sample --n 30000 \
+       --by demand_label --until <first cutoff>   # -> data/raw/sales_sample.parquet (the default data_path)
    ```
-6. **Run the baseline**, then the rest of [section 4](#4-experiments).
+6. **Run the baseline**, then the rest of [section 4](#4-experiments). Without
+   `--profile full`, every command now uses the sample.
 
 Mistakes stop early with one line and a hint (a wrong column name, a missing
 file, a duplicated YAML key, a `based_on` that is not in the ledger). Set
@@ -105,7 +108,7 @@ The configs in `configs/` are the planned sequence:
 
 ```bash
 python -m forecast_fm run configs/01_seasonal_naive.yaml            # ledgered: experiments/exp001-*, git commit
-# set based_on: exp001 in configs/03_chronos2_zero_shot.yaml, then
+# configs/03 has based_on: exp001; check the id in `leaderboard` before each later run
 python -m forecast_fm run configs/03_chronos2_zero_shot.yaml
 python -m forecast_fm leaderboard
 ```

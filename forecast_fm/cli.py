@@ -137,28 +137,40 @@ def cmd_cutoffs(args):
     for k, fold in enumerate(fold_origins(val, project, origin_limit(first, last, project))):
         for o in fold:
             print(f"validation\tfold {k}\tretrain {val[k].date()}\torigin {o.date()}")
+    if not project.holdout_folds and not project.holdout_cutoffs:
+        print("holdout\t\tnone (holdout_folds: 0)")
+        return
     for c in fold_cutoffs(first, last, project, holdout=True):
         print(f"holdout\t\tretrain {c.date()}\torigin {c.date()}")
 
 
 def cmd_run(args):
-    from .ledger import check_reference, record, require_clean
+    from .ledger import check_reference, record, release, require_clean, reserve
     from .runner import run_backtest
 
     project = _project(args)
     exp = _experiment(args, project)
     # everything that can refuse the run does so here, before the backtest
+    reserved = None
     if not args.no_commit:
         require_clean(args.project)
     check_reference(exp, commit=not args.no_commit)
+    if not args.no_commit:
+        reserved = reserve(exp)  # the id is taken now: parallel runs cannot collide
+        print(f"[run] ledger entry {reserved.name} reserved")
     pred_dir = None
     if args.save_predictions:
         pred_dir = Path(project.reports_dir) / "predictions" / exp.name
-    result, _ = run_backtest(project, exp, args.data, shards=args.shards, predictions_dir=pred_dir)
+    try:
+        result, _ = run_backtest(project, exp, args.data, shards=args.shards, predictions_dir=pred_dir)
+    except BaseException:
+        if reserved is not None:
+            release(reserved)
+        raise
     context = {"project_file": args.project, "profile": args.profile, "overrides": args.set,
                "data": args.data, "shards": args.shards, "cutoffs": result["cutoffs"],
                "experiment_file": args.config}
-    out = record(exp, project, result, commit=not args.no_commit, context=context)
+    out = record(exp, project, result, commit=not args.no_commit, context=context, reserved=reserved)
     if pred_dir:
         print(f"[run] predictions -> {pred_dir}")
     for name, t in result["tables"].items():

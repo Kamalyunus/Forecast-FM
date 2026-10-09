@@ -21,7 +21,8 @@ covariate lists, `plan_columns`) instead of renaming them in the export.
 **Format, for all files:**
 - Parquet (preferred) or CSV. A file, a folder of parquet files, a glob such as
   `data/raw/sales/part-*.parquet`, or a list of these.
-- Dates as `YYYY-MM-DD`. Daily data only.
+- Dates as `YYYY-MM-DD`. Daily data only. Timestamps with a time zone are
+  accepted and read as the calendar date (the zone is dropped).
 - One header row; column names exactly as declared in `project.yaml`.
 - IDs as text. With more than one id column (`[sku, warehouse]`), the values
   must not contain `|`.
@@ -48,7 +49,7 @@ system, set `missing_target: nan`.
 | `date` | date | yes | The sales day. |
 | `sku` (+ e.g. `warehouse`) | text | yes | The series key: the grain you order at. A (series, date) pair must be unique, or set `duplicates: sum`. |
 | `units` | number | yes | Demand: units sold that day. Returns: net them out, or keep them separate and set `negative_target`. |
-| `oos_hours` | number 0–24 | strongly recommended | **Hours out of stock that day** (13 = OOS 13 of 24 hours). See *Out-of-stock hours* below. Other forms also work: a 0/1 `in_stock` flag (`in_stock_col`), or stock on hand (`stockout_expr: "stock_on_hand <= 0"`). |
+| `oos_hours` | number 0–24 | **required by the default `project.yaml`** | **Hours out of stock that day** (13 = OOS 13 of 24 hours). See *Out-of-stock hours* below. To use a 0/1 `in_stock` flag or stock on hand instead, edit `project.yaml` as described there. |
 | `price` | number | recommended | The selling price that day. |
 | `discount_pct` | number 0–1 | recommended | `1 - price / regular_price`. Or export `regular_price` and set `derived_columns: {discount_pct: "1 - price / regular_price"}`. |
 | `promo_flag` | 0/1 | recommended | A promotion was running. |
@@ -56,7 +57,7 @@ system, set `missing_target: nan`.
 | `sitewide_event` | number | optional | 0..N: Black Friday, paydays, holidays. The same value for every SKU on a day. |
 | `sessions` | number | optional | Site or product-page sessions. Observed after the fact (a *past* covariate). |
 | `category`, `brand` | text | recommended | Static attributes, one value per SKU. The first value seen is used. They drive metric slices, sharding (`shard_by`), cross-learning (`group_by`) and new-SKU profiles. |
-| `demand_label` | text | optional | Your class per SKU: `intermittent`, `seasonal`, `BAU`, `event`, `promo`. If absent, classes are computed (smooth / erratic / intermittent / lumpy). Used for metric slices and `fine_tune.train_mix`. |
+| `demand_label` | text | optional | Your class per SKU: `intermittent`, `seasonal`, `BAU`, `event`, `promo`. **Compute it from history before the first validation cutoff** (`python -m forecast_fm cutoffs`): it chooses the fine-tuning series and the sample strata, so a label computed over the backtest years leaks. If absent, classes are computed from data up to the first cutoff (smooth / erratic / intermittent / lumpy, plus `no_demand` / `no_history`). |
 
 ### Out-of-stock hours
 
@@ -81,6 +82,11 @@ stockout_expr: "oos_hours >= 12"                   # mostly-OOS days = censored
 - **Time of day matters.** An outage overnight costs fewer sales than one at
   peak hours. If you can, export *lost-peak* hours, or an hourly-sales-weighted
   availability, instead of clock hours.
+- **No `oos_hours`?** Three edits in `project.yaml`: remove `availability` from
+  `derived_columns` and `past_covariate_cols`, set `stockout_expr: null`, and
+  set `in_stock_col: in_stock` (a 0/1 column) or
+  `stockout_expr: "stock_on_hand <= 0"`. Without any stock signal, lost sales
+  look like zero demand.
 - **Days with no sales row** have unknown availability (left missing, not
   "fully on sale"). If your export only has rows for days with sales, add
   `oos_hours` rows for zero-sales days too, otherwise a fully-OOS day with no
@@ -214,14 +220,15 @@ scored on the 90 days after it. Validation windows never overlap the holdout.
 
 ## Before the first run: checklist
 
-1. Put the files under `data/raw/` and fill in the `TODO`s in `project.yaml`.
-2. `python -m forecast_fm config --check-data`: every declared column is present.
-3. `python -m forecast_fm audit`: row counts, date range, zero share, stockout
+1. Put the files under `data/raw/` (the full history as `data/raw/sales_full.parquet`,
+   which the `full` profile points at) and fill in the `TODO`s in `project.yaml`.
+2. `python -m forecast_fm --profile full config --check-data`: every declared column is present.
+3. `python -m forecast_fm --profile full audit`: row counts, date range, zero share, stockout
    share, covariate types, demand classes, fold cutoffs. Review it, and write
    down what the columns mean in `experiments/DATA_NOTES.md`.
-4. `python -m forecast_fm cutoffs`: export plan snapshots `as_of` these dates.
-5. On the full catalog, draw the experiment sample:
-   `python -m forecast_fm sample --src data/raw/sales_full.parquet --n 30000 --by demand_label --until <first cutoff>`.
+4. `python -m forecast_fm --profile full cutoffs`: export plan snapshots `as_of` these dates.
+5. Draw the experiment sample (the default `data_path`, used by every command without `--profile full`):
+   `python -m forecast_fm --profile full sample --n 30000 --by demand_label --until <first cutoff>`.
 
 ## Questions to settle with the data owner
 
@@ -249,6 +256,7 @@ parts (`pandas.read_parquet(folder)` reads all of them): one row per **SKU × da
 | `series_id`, plus your id columns | The SKU (and warehouse, ...). |
 | `ts`, `horizon` | The forecast day, and how many days ahead it is (1–90). |
 | `y_pred` | Point forecast (Chronos-2: the median; new SKUs: the profile mean). |
-| `q_0.1` … `q_0.95` | Quantiles (`quantiles` and `service_level` in `project.yaml`). |
+| `q_0.1` … `q_0.95` | Quantiles (`quantiles` and `service_level` in `project.yaml`). Only from models that produce them (`chronos2`, and the cold-start rows); the point baselines write none. |
 | `lifecycle` | `established` (model), `short_history` or `new` (launch profile). |
+| *missing `y_pred`* | No forecast could be made: a new SKU with no analog launches in its category or anywhere, or a discontinued SKU with no row within the model's context. Treat as unknown, never as 0. The run's stats count them. |
 | `model` | The experiment or checkpoint name that produced it. |

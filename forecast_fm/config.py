@@ -210,9 +210,17 @@ class ProjectConfig:
 
         if self.horizon < 1:
             errors.append("horizon must be >= 1")
-        if (sorted(self.horizon_buckets) != list(self.horizon_buckets) or not self.horizon_buckets
-                or self.horizon_buckets[-1] != self.horizon):
-            errors.append("horizon_buckets must be ascending and end at horizon")
+        hb = list(self.horizon_buckets)
+        if (not hb or hb != sorted(set(hb)) or hb[0] < 1 or hb[-1] != self.horizon
+                or any(int(b) != b for b in hb)):
+            errors.append("horizon_buckets must be strictly increasing positive integers ending at horizon")
+        if self.season_length < 1:
+            errors.append("season_length must be >= 1")
+        prof = self.cold_start.get("profile_cols") or []
+        flat = [c for lvl in prof for c in (lvl if isinstance(lvl, (list, tuple)) else [lvl])]
+        bad_prof = [c for c in flat if c not in static]
+        if bad_prof:
+            errors.append(f"cold_start.profile_cols {bad_prof} must be static_cols")
         if self.origin_step_days is not None and self.origin_step_days < 1:
             errors.append("origin_step_days must be >= 1 (or null)")
         if self.fold_step < 1 or self.n_folds < 1 or self.holdout_folds < 0:

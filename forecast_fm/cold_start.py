@@ -30,11 +30,13 @@ profile_cols, min_analogs (20), new_series_path, launch_date_col
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
 from .config import ProjectConfig
-from .data import SERIES, STOCKOUT, TS, Y, make_series_id, read_table
+from .data import SERIES, STOCKOUT, TS, Y, make_series_id, naive_dates, read_table
 from .plans import AS_OF, HORIZON
 
 LAUNCH = "launch_date"
@@ -66,16 +68,17 @@ def _key(df: pd.DataFrame, cols: list[str]) -> pd.Series:
 
 
 def launch_profiles(history: pd.DataFrame, project: ProjectConfig, max_age: int,
-                    quantiles: list[float]) -> dict:
+                    quantiles: list[float], data_start: pd.Timestamp | None = None) -> dict:
     """{level (tuple of cols): DataFrame indexed by (key, age) with columns
-    mean, q_<q>..., n}. Only analogs with an observed launch count."""
+    mean, q_<q>..., n}. Only analogs with an observed launch count: a series
+    whose first row is the first day of the DATA (`data_start`: the whole
+    dataset's, not this shard's or pool's) may have launched earlier."""
     cfg = settings(project)
     first = history.groupby(SERIES, observed=True)[TS].min()
-    data_start = history[TS].min()
+    data_start = pd.Timestamp(data_start) if data_start is not None else history[TS].min()
     launched = first[first > data_start]  # launch observed, not left-censored
     h = history[history[SERIES].isin(launched.index) & ~history[STOCKOUT] & history[Y].notna()]
-    lmap = dict(zip(np.asarray(launched.index.astype(str)), launched.to_numpy(), strict=True))
-    launch = (pd.to_datetime(h[SERIES].astype(str).map(lmap)) if len(h)
+    launch = (pd.to_datetime(h[SERIES].map(launched).astype("datetime64[ns]")) if len(h)
               else pd.Series(pd.NaT, index=h.index, dtype="datetime64[ns]"))
     h = h.assign(**{AGE: (h[TS] - launch).dt.days})
     h = h[h[AGE] < max_age]
@@ -97,7 +100,8 @@ def launch_profiles(history: pd.DataFrame, project: ProjectConfig, max_age: int,
 
 def _lookup(profiles: dict, statics: pd.DataFrame, ages: np.ndarray, cols: list[str]) -> pd.DataFrame:
     """Profile rows for each (series row, age): the finest level with enough
-    analogs at that age; ages past the last supported age carry its value."""
+    analogs at that age; ages past the last supported age carry its value.
+    NaN where no level has a profile (no analog pool at all)."""
     n = len(ages)
     out = pd.DataFrame(np.nan, index=range(n), columns=cols)
     found = np.zeros(n, dtype=bool)
@@ -114,14 +118,17 @@ def _lookup(profiles: dict, statics: pd.DataFrame, ages: np.ndarray, cols: list[
         hit = ~found & ~np.isnan(vals[:, 0]) & (a >= 0)
         out.loc[hit, :] = vals[hit]
         found |= hit
-    return out.fillna(0.0)
+    return out
 
 
 def forecast(cold: pd.DataFrame, history: pd.DataFrame, project: ProjectConfig,
-             cutoff: pd.Timestamp) -> tuple[pd.DataFrame, dict]:
+             cutoff: pd.Timestamp, data_start: pd.Timestamp | None = None) -> tuple[pd.DataFrame, dict]:
     """cold: one row per cold series with SERIES, LAUNCH (datetime), statics,
     and `hist_sum` / `hist_age` for short-history series (0 for new ones).
-    Returns the long frame [series_id, ts, horizon, y_pred, q_*] and stats."""
+    Returns the long frame [series_id, ts, horizon, y_pred, q_*] and stats.
+    A series with no analog profile at any level gets NaN (unknown, counted
+    as a missing forecast), never a silent 0. `data_start`: the dataset's
+    first date, so launches are judged the same in every shard."""
     cfg = settings(project)
     H = project.horizon
     qs = sorted(set(project.quantiles) | {0.5})
@@ -143,9 +150,9 @@ def forecast(cold: pd.DataFrame, history: pd.DataFrame, project: ProjectConfig,
         return out, {"n_cold": n, "method": "zero"}
 
     max_age = int(max(ages.max(), 0)) + 1
-    # a cold series is never its own analog
-    pool = history[~history[SERIES].astype(str).isin(set(cold[SERIES].astype(str)))]
-    profiles = launch_profiles(pool, project, max_age, qs)
+    # a cold series is never its own analog (isin on the categorical: no per-row strings)
+    pool = history[~history[SERIES].isin(set(cold[SERIES].astype(str)))]
+    profiles = launch_profiles(pool, project, max_age, qs, data_start)
     cols = ["mean", *qcols]
     statics = cold.iloc[rep].reset_index(drop=True)
     vals = _lookup(profiles, statics, np.maximum(ages, 0), cols)
@@ -158,7 +165,7 @@ def forecast(cold: pd.DataFrame, history: pd.DataFrame, project: ProjectConfig,
         s_rep = np.repeat(s_idx, cold["hist_age"].to_numpy()[s_idx])
         s_age = np.concatenate([np.arange(a) for a in cold["hist_age"].to_numpy()[s_idx]])
         past = _lookup(profiles, cold.iloc[s_rep].reset_index(drop=True), s_age, ["mean"])["mean"]
-        expected = pd.Series(past.to_numpy()).groupby(s_rep).sum().reindex(s_idx).to_numpy()
+        expected = pd.Series(past.to_numpy()).fillna(0.0).groupby(s_rep).sum().reindex(s_idx).to_numpy()
         prior = 7 * max(float(np.nanmean(past)) if len(past) else 0.0, 1e-6)
         ratio = (cold["hist_sum"].to_numpy()[s_idx] + prior) / (expected + prior)
         scale[s_idx] = np.clip(ratio, 0.2, 5.0)
@@ -168,10 +175,15 @@ def forecast(cold: pd.DataFrame, history: pd.DataFrame, project: ProjectConfig,
         out[c] = vals[c].to_numpy() * factor
     q = np.sort(out[qcols].to_numpy(), axis=1)  # scaling keeps order; guard ties/NaN
     out[qcols] = q
+    no_profile = int(pd.Series(vals["mean"].isna().to_numpy()).groupby(rep).all().sum())
+    if no_profile:
+        warnings.warn(f"cold start at {pd.Timestamp(cutoff).date()}: {no_profile} of {n} series have no "
+                      "analog launch profile at any level (too few observed launches); their forecast "
+                      "is missing (NaN), not 0", stacklevel=2)
     n_analog_levels = {"/".join(k) or "all": int(v.index.get_level_values(0).nunique())
                        for k, v in profiles.items()}
     return out, {"n_cold": n, "n_short_history": int(short.sum()), "method": "launch_profile",
-                 "profile_keys": n_analog_levels}
+                 "n_no_profile": no_profile, "profile_keys": n_analog_levels}
 
 
 def production_new_series(project: ProjectConfig, history: pd.DataFrame, cutoff: pd.Timestamp,
@@ -190,7 +202,7 @@ def production_new_series(project: ProjectConfig, history: pd.DataFrame, cutoff:
             raise ValueError(f"cold_start.new_series_path lacks series id columns {missing}")
         f[SERIES] = make_series_id(f, project.series_id_cols)
         lc = cfg["launch_date_col"]
-        f[LAUNCH] = pd.to_datetime(f[lc]) if lc in f.columns else pd.Timestamp(cutoff) + pd.Timedelta(days=1)
+        f[LAUNCH] = naive_dates(f[lc]) if lc in f.columns else pd.Timestamp(cutoff) + pd.Timedelta(days=1)
         frames.append(f[[SERIES, LAUNCH, *[c for c in project.static_cols if c in f.columns]]])
     if cfg["from_plans"] and plans is not None and len(plans):
         snap = plans[plans[AS_OF] <= pd.Timestamp(cutoff)]

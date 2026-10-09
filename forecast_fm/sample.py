@@ -21,13 +21,18 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from .config import ProjectConfig
-from .data import SERIES, make_series_id
+from .data import SERIES, _expand, make_series_id
 
 
-def _dataset(path: str | Path) -> ds.Dataset:
-    path = Path(path)
-    fmt = "csv" if path.suffix == ".csv" else "parquet"
-    return ds.dataset(str(path), format=fmt)
+def _dataset(path: str | Path | list) -> ds.Dataset:
+    """The same inputs data_path accepts: a file, a parquet directory, a glob
+    or a list; csv (also compressed) or parquet."""
+    files = [str(f) for f in _expand(path)]
+    if any(".csv" in Path(f).suffixes for f in files):
+        if not all(".csv" in Path(f).suffixes for f in files):
+            raise ValueError("sample: mix of csv and parquet inputs")
+        return ds.dataset(files, format="csv")
+    return ds.dataset(files if len(files) > 1 or not Path(files[0]).is_dir() else files[0], format="parquet")
 
 
 def series_stats(path: str | Path, id_cols: list[str], target: str, by: str | None,
@@ -73,6 +78,14 @@ def allocate(sizes: pd.Series, n: int, floor: int) -> pd.Series:
     n = min(n, int(sizes.sum()))
     base = np.minimum(sizes, floor)
     if base.sum() >= n:
+        # floors alone exceed n: scale them down so the sample stays n series
+        if base.sum() > n:
+            scaled = np.floor(base * n / base.sum()).astype(int)
+            rem = n - int(scaled.sum())
+            if rem > 0:
+                frac = (base * n / base.sum() - scaled).where(sizes - scaled > 0, -1)
+                scaled.loc[frac.sort_values(ascending=False, kind="stable").index[:rem]] += 1
+            return scaled
         return base
     quota = base.copy()
     for _ in range(len(sizes) + 1):  # redistribute until caps stop binding

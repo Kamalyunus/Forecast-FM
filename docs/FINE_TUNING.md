@@ -36,8 +36,16 @@ model_params:
       seed: 42
 ```
 
-`configs/07_chronos2_lora_rounds.yaml` is this recipe. `configs/05` is the
-minimal one (LoRA, 1000 steps, everything else default).
+`configs/07_chronos2_lora_rounds.yaml` is this recipe; `07a` is the same with
+`rounds: 1`, the reference the rounds test is judged against. `configs/05` is
+the minimal one: LoRA, 1000 steps, learning rate 1e-5, batch 64.
+
+Code defaults when a key is omitted: `mode: full`, `num_steps: 1000`,
+`learning_rate: 1e-6`, `batch_size: 256`, `context_length` = the
+`model_params` value, else the model's own limit, `rounds: 1`, no
+`train_window_days` (whole history), no `train_mix` (every series),
+`max_pool_series: 200000`, `log_every` = steps per round / 50.
+`python -m forecast_fm models chronos2` prints the same list.
 
 ## What one training step is
 
@@ -131,6 +139,17 @@ models/<name>-<as_of>/
 Existing checkpoints are never overwritten unless you pass `--force`. Retrain
 on your own schedule with a new `--as-of`; each `forecast` reports the
 checkpoint's age in days.
+
+## Known limitation: categorical covariates in training
+
+Chronos-2 target-encodes a categorical covariate (`promo_type`) per series
+before it cuts training windows, so during fine-tuning the encoding of a day
+already reflects demand on later days of the same series, while at forecast
+time it is built from the context only. The library does this, not this repo.
+The effect is a mild train/serve mismatch, not a cutoff leak (every row is
+still before the cutoff). Prefer numeric covariates (`promo_flag`,
+`discount_pct`) for fine-tuning, and judge a categorical one by its backtest
+verdict, never by its training loss.
 
 ## Is the fine-tune good? Judge it like any experiment
 

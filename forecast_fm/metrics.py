@@ -42,10 +42,16 @@ def prepare(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | No
     p = preds[has_truth & ~missing].copy()
     y, f = p["y_true"].to_numpy(np.float64), p["y_pred"].to_numpy(np.float64)
     p["_y"], p["_ae"], p["_e"] = y, np.abs(f - y), f - y
-    for q in _quantiles(p):
-        d = y - p[f"{Q_PREFIX}{q:g}"].to_numpy(np.float64)
-        p[f"_pl{q:g}"] = np.maximum(q * d, (q - 1) * d)
-        p[f"_cov{q:g}"] = (d <= 0).astype(np.float64)
+    qs = _quantiles(p)
+    if qs:
+        # rows without quantiles (a point model's rows next to cold-start rows
+        # that have them) must not count as zero loss / not covered
+        hq = p[[f"{Q_PREFIX}{q:g}" for q in qs]].notna().all(axis=1).to_numpy()
+        p["_hq"], p["_y_q"] = hq.astype(np.float64), np.where(hq, y, 0.0)
+        for q in qs:
+            d = y - p[f"{Q_PREFIX}{q:g}"].to_numpy(np.float64)
+            p[f"_pl{q:g}"] = np.where(hq, np.maximum(q * d, (q - 1) * d), 0.0)
+            p[f"_cov{q:g}"] = np.where(hq, (d <= 0).astype(np.float64), 0.0)
     p["bucket"] = bucket_labels(p[HORIZON], project.horizon_buckets)
     sid = p[SERIES].astype(str)
     if classes is not None:
@@ -84,6 +90,8 @@ def partial(p: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     (fold, series)."""
     qs = _quantiles(p)
     cols = ["_y", "_ae", "_e", *[f"_pl{q:g}" for q in qs], *[f"_cov{q:g}" for q in qs]]
+    if qs:
+        cols += ["_hq", "_y_q"]
     key = by or ["_all"]
     q = p.assign(_all="all") if not by else p
     sums = q.groupby(key, observed=True)[cols].sum()
@@ -107,9 +115,14 @@ def finalize(parts: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     out["wape"] = sums["_ae"] / denom
     out["bias"] = sums["_e"] / denom
     if qs:
-        out["wql"] = sum(2 * sums[f"_pl{q:g}"] for q in qs) / len(qs) / denom
+        # over the rows that have quantiles; NaN where some rows lack them,
+        # so a point model never shows a calibration it did not produce
+        full = sums["_hq"] >= sums["n"]
+        denom_q = sums["_y_q"].replace(0, np.nan).where(full)
+        n_q = sums["_hq"].replace(0, np.nan).where(full)
+        out["wql"] = sum(2 * sums[f"_pl{q:g}"] for q in qs) / len(qs) / denom_q
         for q in qs:
-            out[f"cov{q:g}"] = sums[f"_cov{q:g}"] / out["n"]
+            out[f"cov{q:g}"] = sums[f"_cov{q:g}"] / n_q
     out["mase"] = sums["_mase_sum"] / sums["_mase_n"].replace(0, np.nan)
     return out.reset_index(drop=not by)
 

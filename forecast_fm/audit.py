@@ -12,6 +12,11 @@ from .data import SERIES, STOCKOUT, TS, Y, categorical_cols, demand_classes
 from .folds import fold_cutoffs
 
 
+def _missing_share(col: pd.Series, categorical: bool) -> float:
+    """Missing categoricals are the "" token in the panel, not NaN."""
+    return float((col.astype(str) == "").mean()) if categorical else float(col.isna().mean())
+
+
 def audit(panel: pd.DataFrame, raw_rows: int, project: ProjectConfig, out: str | Path) -> str:
     n_series = panel[SERIES].nunique()
     lengths = panel.groupby(SERIES, observed=True).size()
@@ -38,10 +43,10 @@ def audit(panel: pd.DataFrame, raw_rows: int, project: ProjectConfig, out: str |
     ]
     for c in project.known_covariate_cols:
         lines.append(f"| {c} | known | {'categorical' if c in cats else 'numeric'} | "
-                     f"{panel[c].isna().mean():.1%} | {project.policy(c)} |")
+                     f"{_missing_share(panel[c], c in cats):.1%} | {project.policy(c)} |")
     for c in project.past_covariate_cols:
         lines.append(f"| {c} | past | {'categorical' if c in cats else 'numeric'} | "
-                     f"{panel[c].isna().mean():.1%} | never in horizon |")
+                     f"{_missing_share(panel[c], c in cats):.1%} | never in horizon |")
     for c in project.static_cols:
         lines.append(f"| {c} | static | categorical | — | group_by / slices |")
     vc = classes.value_counts()
