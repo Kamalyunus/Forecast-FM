@@ -26,7 +26,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 113 tests (99 run without torch; 14 need the tiny real Chronos-2).
+`pytest`: 129 tests (114 run without torch; 15 need the tiny real Chronos-2).
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
@@ -210,7 +210,7 @@ Compute scales with (1 + n_covariates) variates per series. Measure accuracy aga
 
 ## 6. Environment
 
-See `README.md` → "Setup on a Mac". Quick check:
+See `README.md` → "1. Install". Quick check:
 
 ```bash
 python -m forecast_fm env     # "mps": true, "auto_device": "mps"

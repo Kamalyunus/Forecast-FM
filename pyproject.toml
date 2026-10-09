@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forecast-fm"
-version = "0.1.0"
+version = "0.2.0"
 description = "Chronos-2 foundation-model demand forecasting for ecommerce replenishment"
 requires-python = ">=3.10"
 dependencies = [

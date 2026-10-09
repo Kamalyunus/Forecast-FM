@@ -172,6 +172,8 @@ export it now if it's easy, so the history exists.
 
 ## How the history is used
 
+(Fine-tuning in depth: [`FINE_TUNING.md`](FINE_TUNING.md).)
+
 **Backtest folds.** Each fold's cutoff is a *retrain date*. With
 `origin_step_days` (e.g. 7) the fold's model also forecasts from every 7th day
 until the next cutoff, reading the newest history as context but never

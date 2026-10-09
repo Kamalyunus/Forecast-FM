@@ -70,6 +70,13 @@ def panel_from(raw: pd.DataFrame, project: ProjectConfig) -> pd.DataFrame:
 LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    """A developer's shell settings must not pick the tests' project file."""
+    for var in ("FORECAST_FM_PROJECT", "FORECAST_FM_PROFILE", "FORECAST_FM_DEBUG"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def tiny(monkeypatch, tmp_path):
     pytest.importorskip("chronos")

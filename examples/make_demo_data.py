@@ -26,6 +26,7 @@ from forecast_fm.folds import fold_cutoffs  # noqa: E402
 OUT = Path("data/demo")
 
 
+START = "2022-01-01"
 HISTORY_DAYS = 1100
 FUTURE_DAYS = 90
 
@@ -36,7 +37,7 @@ def make(n_series: int = 300, days: int = HISTORY_DAYS + FUTURE_DAYS, seed: int 
     series only have rows on sale days, like a typical order extract; plans
     cover every day. The last `n_upcoming` series launch after the history."""
     rng = np.random.default_rng(seed)
-    dates = pd.date_range("2022-01-01", periods=days, freq="D")
+    dates = pd.date_range(START, periods=days, freq="D")
     t = np.arange(days)
     event = np.zeros(days)
     for d in dates[(dates.month == 11) & (dates.day >= 24) & (dates.day <= 28)]:
@@ -98,7 +99,9 @@ if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     project = load_project("examples/demo_project.yaml")
     raw, full = make()
-    last = raw["date"].min() + pd.Timedelta(days=HISTORY_DAYS - 1)
+    # from the grid start, not the first sale: the last plan snapshot must cover
+    # the full 90 days after `last`, like a real production plan
+    last = pd.Timestamp(START) + pd.Timedelta(days=HISTORY_DAYS - 1)
     hist = raw[raw["date"] <= last]
     hist.to_parquet(OUT / "sales.parquet", index=False)
     first = hist["date"].min()

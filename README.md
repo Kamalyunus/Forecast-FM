@@ -1,232 +1,239 @@
 # Forecast-FM
 
-Chronos-2 demand forecasting for ecommerce replenishment. Daily demand for
-~700k series, 35-day and 90-day lead times, price/promo plans as known
-covariates. The target setup is **an Apple Silicon Mac (MPS)**; CUDA and CPU
-also work.
+Demand forecasting for ecommerce replenishment with **Chronos-2**, a
+time-series foundation model: zero-shot first, then **fine-tuned on your own
+sales history**. Daily demand, 90-day horizon reported at the 35-day and 90-day
+lead times, price and promo plans as known covariates, new-SKU forecasts, and
+a leakage-safe backtest with an append-only experiment ledger. Built to run on
+an **Apple Silicon Mac**; CUDA and CPU also work.
 
-- `docs/DATA_REQUIREMENTS.md`: **what data to export and in what format** (templates in `docs/data_templates/`)
-- `docs/SPEC.md`: what to build, in what order, with status
-- `CLAUDE.md`: the rules for working in this repo (pipeline, leakage, ledger)
+| Read this | When |
+|---|---|
+| this README | first hour: install, try the demo, point it at your data |
+| [`docs/DATA_REQUIREMENTS.md`](docs/DATA_REQUIREMENTS.md) | exporting the data: files, columns, formats (templates in `docs/data_templates/`) |
+| [`docs/FINE_TUNING.md`](docs/FINE_TUNING.md) | fine-tuning: what the knobs do, cost, millions of SKUs |
+| [`docs/SPEC.md`](docs/SPEC.md) | what is built, what is not, in what order |
+| [`CLAUDE.md`](CLAUDE.md) | the rules for working in this repo (pipeline, leakage, ledger) |
 
-## Setup on a Mac (Apple Silicon)
+## 1. Install
 
 ```bash
-# 1. arm64 Python 3.10+ (NOT an x86 Python under Rosetta: it cannot see MPS)
-python3 -c "import platform; print(platform.machine())"   # must print arm64
+# arm64 Python 3.10+ (an x86 Python under Rosetta cannot see the GPU)
+python3 -c "import platform; print(platform.machine())"     # must print arm64 on a Mac
 
-# 2. environment
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[foundation,dev]"     # the default PyPI torch wheel has MPS
-
-# 3. check
-python -m forecast_fm env              # expect "mps": true, "auto_device": "mps"
-pytest                                 # all green, including the tiny Chronos-2 tests
-
-# 4. Chronos-2 weights (downloaded on first use; or pin a local copy)
-huggingface-cli download amazon/chronos-2 --local-dir models/chronos-2
-#    then set model_params.model_id: models/chronos-2
+pip install -e ".[foundation,dev]"       # torch + chronos-forecasting + peft + pytest + ruff
+python -m forecast_fm env                # expect "mps": true, "auto_device": "mps"
+pytest                                   # green (about 2 minutes on the first run)
 ```
 
-Mac notes:
-- `device: auto` picks CUDA, then MPS, then CPU. `PYTORCH_ENABLE_MPS_FALLBACK=1` is
-  set automatically, so an op MPS lacks falls back to CPU instead of failing.
-- `dtype: bfloat16` on MPS needs macOS 14+. Keep `float32` until a parity
-  check on the sample shows bf16 matches it.
-- Long runs: `caffeinate -i python -m forecast_fm run ...` stops the Mac
-  sleeping mid-backtest.
-- Unified memory is shared by the panel and the model. A 30k-series sample fits
-  easily in 32 GB. All 700k series x 4 years (~1B rows) do not fit as one
-  panel, so the full run is sharded by series (see `docs/SPEC.md`, WP4).
+The Chronos-2 weights (`amazon/chronos-2`, about 500 MB) download from Hugging
+Face on first use. No internet on the work machine? Copy them once:
 
-## Configuring `project.yaml`
+```bash
+huggingface-cli download amazon/chronos-2 --local-dir models/chronos-2
+# then in project.yaml:  model_defaults: {chronos2: {model_id: models/chronos-2}}
+```
 
-Every option is documented in `project.yaml`. Beyond the columns and covariate classes:
+`python -m forecast_fm --help` lists the commands in the order you will use
+them, and `<command> --help` explains every flag.
+
+## 2. Try it in five minutes (synthetic data)
+
+```bash
+python examples/make_demo_data.py                      # -> data/demo/ (300 SKUs, 3 years, plans, new SKUs)
+export FORECAST_FM_PROJECT=examples/demo_project.yaml  # instead of -p ... on every command
+
+python -m forecast_fm audit                            # what the data looks like -> reports/data_audit.md
+python -m forecast_fm run configs/01_seasonal_naive.yaml --no-commit      # the baseline (seconds)
+python -m forecast_fm run configs/03_chronos2_zero_shot.yaml --no-commit  # Chronos-2, no training
+python -m forecast_fm forecast configs/03_chronos2_zero_shot.yaml         # the production file
+```
+
+`--no-commit` is a debug run: results go to `reports/scratch/`, nothing is
+ledgered. Each run prints metrics by fold, horizon bucket (`h01-35`,
+`h36-90`), lifecycle and demand class. `forecast` writes one row per SKU × day,
+new SKUs included, under `reports/forecast_<date>/`.
+
+## 3. Your own data
+
+1. **Export the files** described in [`docs/DATA_REQUIREMENTS.md`](docs/DATA_REQUIREMENTS.md):
+   sales history (required), plan snapshots (prices and promos as they were
+   planned on each forecast date), and optionally upcoming SKUs. Put them under
+   `data/raw/`.
+2. **Fill in `project.yaml`.** Every `TODO` marks a column or policy that is
+   yours to set: column names, which covariates are *known* in advance and
+   which are only *observed*, the stockout rule, the service level. The file
+   explains each option in place. Check what the code will use:
+   ```bash
+   unset FORECAST_FM_PROJECT                 # back to ./project.yaml
+   python -m forecast_fm config --check-data # resolved settings; every declared column present?
+   ```
+3. **Audit** the data and read the report with whoever owns the data:
+   ```bash
+   python -m forecast_fm audit               # -> reports/data_audit.md
+   ```
+   Write down what the columns mean in `experiments/DATA_NOTES.md`.
+4. **Get plan snapshots for the backtest dates.** Backtests must only see what
+   was known at the time, so each fold needs the plan as it stood on its
+   cutoff. `python -m forecast_fm cutoffs` lists the dates.
+5. **Draw the experiment sample** from the full catalog (experiments run on
+   20–50k series, the final forecast on everything):
+   ```bash
+   python -m forecast_fm sample --src data/raw/sales_full.parquet --n 30000 \
+       --by demand_label --until <first cutoff>   # -> data/raw/sales_sample.parquet + manifest
+   ```
+6. **Run the baseline**, then the rest of [section 4](#4-experiments).
+
+Mistakes stop early with one line and a hint (a wrong column name, a missing
+file, a duplicated YAML key, a `based_on` that is not in the ledger). Set
+`FORECAST_FM_DEBUG=1` for the full traceback.
+
+## 4. Experiments
+
+One hypothesis per config, each compared against the run it is `based_on`.
+The configs in `configs/` are the planned sequence:
+
+| config | tests |
+|---|---|
+| `01_seasonal_naive` | the bar every model must beat (the reference) |
+| `03_chronos2_zero_shot` | Chronos-2 with all covariates, no training |
+| `04_chronos2_group_by` | cross-learning within a category |
+| `05_chronos2_lora` | LoRA fine-tuning on fold history |
+| `06a/b/c_ft_*` | which SKUs to fine-tune on: continuous only / natural mix / capped intermittent |
+| `07_chronos2_lora_rounds` | the full recipe: 50k steps, 10 rounds of fresh SKUs, fixed 2-year window |
+
+```bash
+python -m forecast_fm run configs/01_seasonal_naive.yaml            # ledgered: experiments/exp001-*, git commit
+# set based_on: exp001 in configs/03_chronos2_zero_shot.yaml, then
+python -m forecast_fm run configs/03_chronos2_zero_shot.yaml
+python -m forecast_fm leaderboard
+```
+
+A ledgered run refuses to start while `forecast_fm/` or `project.yaml` has
+uncommitted changes, so every result is reproducible. The verdict is
+`improved` / `regressed` / `inconclusive` (the change must hold across folds)
+or `incomparable` (different data, policy, horizon or cutoffs than the
+reference). `experiments/` is append-only.
+
+**Fine-tuned recipes are measured the same way:** a config with `fine_tune:`
+is retrained inside every fold. Measure the time first:
+
+```bash
+python -m forecast_fm bench configs/07_chronos2_lora_rounds.yaml --catalog 3000000 --memory-gb 24
+# seconds/step and series/s on this machine -> hours per fine-tune, backtest and production forecast
+```
+
+Default folds retrain every 91 days with one forecast per fold. Set
+`origin_step_days: 7` to forecast weekly from each fold's model until the
+next retrain, as production will: more evidence per fine-tune, plus a
+`model_age` table (accuracy against weeks since retraining) that tells you how
+often to retrain.
+
+## 5. Fine-tune once, forecast on a schedule
+
+When the backtest says the recipe wins, train it once on all history and save it:
+
+```bash
+python -m forecast_fm finetune configs/07_chronos2_lora_rounds.yaml          # -> models/chronos2-lora-rounds-<date>/
+python -m forecast_fm forecast models/chronos2-lora-rounds-<date>/forecast_config.yaml --shards 16
+```
+
+The model directory holds the weights, a provenance manifest (base model,
+recipe, training window, data fingerprint, code commit) and a ready
+`forecast_config.yaml`. A saved checkpoint refuses to forecast from any date
+before its training end, so it can never be scored on data it has seen.
+Retrain with a new `--as-of`; existing checkpoints are never overwritten
+without `--force`. Everything about the recipe, cost, training on millions of
+SKUs, and the fixed training window: [`docs/FINE_TUNING.md`](docs/FINE_TUNING.md).
+
+### The production file
+
+`forecast` writes one row per series × day × horizon step for **every** series:
+
+```
+origin, series_id, <your id cols>, ts, horizon, y_pred, q_0.1, ..., q_0.95, lifecycle, model
+```
+
+`lifecycle` says how each series was forecast: `established` by the model,
+`short_history` (less than `min_history_days`) and `new` (not launched yet) by a
+launch profile from past launches in the same category. New SKUs come from
+`cold_start.new_series_path` and from plan-snapshot SKUs with no history.
+
+The output is a directory of parquet parts; `pandas.read_parquet(dir)` reads
+it all. For a catalog that does not fit in memory:
+
+```bash
+python -m forecast_fm forecast <config> --shards 16                 # one shard in memory at a time
+python -m forecast_fm forecast <config> --shards 16 --shard 0 &     # or parallel processes, one shard each
+```
+
+Shards stream only their own rows, finished parts are skipped on rerun
+(`--force` redoes them), and `shard_by: [category]` keeps a category in one
+shard so cross-learning and launch profiles see the whole group. `run --shards N`
+gives metrics identical to an unsharded backtest.
+
+## 6. Configuring `project.yaml`
+
+Every option is documented in the file itself. Beyond the columns and covariate classes:
 
 | need | option |
 |---|---|
 | several files / a glob / a parquet folder | `data_path: [a.parquet, "parts/*.csv"]` |
 | compute a column (`1 - price/regular_price`) | `derived_columns` (also applied to plan files) |
 | keep a subset (channel, country, date window) | `row_filter`, `start_date`, `end_date` |
+| stockouts from hours out of stock or stock levels | `stockout_expr: "oos_hours >= 12"`, `in_stock_col` |
 | new SKUs / short histories | `min_history_days`, `cold_start` |
 | large catalogs | `shard_by`, `--shards N` |
 | repeated (series, date) rows | `duplicates: sum \| mean \| max \| first \| last` |
 | returns / missing days | `negative_target`, `missing_target` |
-| stockouts from stock levels | `stockout_expr: "stock_on_hand <= 0"` |
 | plan files with other column names | `plan_as_of_col`, `plan_timestamp_col`, `plan_columns` |
 | stale or incomplete plans | `plan_max_age_days`, `min_plan_coverage` |
+| production-like backtest (retrain vs forecast dates) | `origin_step_days` |
 | fixed backtest dates | `cutoffs`, `holdout_cutoffs` |
 | decision quantile | `service_level` |
 | metrics by category / brand | `slice_cols` |
 | machine settings for every experiment | `model_defaults: {chronos2: {device: mps}}` |
 | output locations | `reports_dir`, `models_dir` |
 
-Layering: `extends: base.yaml`, named `profiles:` (`--profile full`), command-line
-overrides (`--set horizon=35 --set covariate_eval_policy.price=carry_forward`) and
-`${ENV_VAR:-default}` in any string. Check the result with:
+Layering: `extends: base.yaml`, named `profiles:` (`--profile full`),
+command-line overrides (`--set horizon=35 --set covariate_eval_policy.price=carry_forward`)
+and `${ENV_VAR:-default}` in any string. `-p` picks the project file
+(`$FORECAST_FM_PROJECT` sets the default). Duplicate keys are an error rather
+than a silent override.
 
-```bash
-python -m forecast_fm --profile full config --check-data
-```
+## Mac notes
 
-## Workflow
-
-```bash
-python -m forecast_fm sample --src data/raw/sales_full.parquet --n 30000 \
-    --by demand_label --volume-bins 10 --seed 42        # stratified sample + manifest
-python -m forecast_fm audit                              # -> reports/data_audit.md
-python -m forecast_fm cutoffs                            # export plan snapshots as_of these dates
-python -m forecast_fm run configs/01_seasonal_naive.yaml --no-commit   # debug run
-python -m forecast_fm run configs/01_seasonal_naive.yaml               # ledgered run (+ git commit)
-python -m forecast_fm leaderboard
-python -m forecast_fm forecast configs/03_chronos2_zero_shot.yaml      # production forecast
-```
-
-### Production forecast: the long daily file, sharded
-
-`forecast` writes one row per series × day × horizon step for **every** series,
-new SKUs included:
-
-```
-origin, series_id, <your id cols>, ts, horizon, y_pred, q_0.1, ..., q_0.95, lifecycle, model
-```
-
-`lifecycle` says how each series was forecast. `established` series went to
-the model. `short_history` series (less than `min_history_days` at the origin)
-and `new` series (not launched yet) got a launch profile from past launches in
-their category (`cold_start` in `project.yaml`). New SKUs come from
-`cold_start.new_series_path` (id columns, statics, optional `launch_date`) and
-from plan-snapshot SKUs that have no history.
-
-The output is a directory of parquet parts; `pandas.read_parquet(dir)` reads it all:
-
-```bash
-python -m forecast_fm forecast models/<ckpt>/forecast_config.yaml --shards 16
-# or as parallel processes, one shard each (the last to finish writes _manifest.json):
-python -m forecast_fm forecast <config> --shards 16 --shard 0 &
-python -m forecast_fm forecast <config> --shards 16 --shard 1 &
-```
-
-- **One shard in memory at a time.** Each shard streams only its own rows from
-  the data and the plan files, so memory is bounded by one shard, not the catalog.
-- **Resumable.** A finished part is skipped on rerun; pass `--force` to redo it.
-- **Groups stay together.** `shard_by: [category]` keeps a category in one shard,
-  so `group_by` cross-learning and launch profiles see the whole group.
-- **Retrain vs forecast dates.** With `origin_step_days: 7`, each backtest fold
-  fine-tunes once at its cutoff and forecasts weekly from that model until the
-  next cutoff, like production. Results include a `model_age` table (accuracy
-  vs weeks since retraining), which is your retrain-cadence evidence.
-- **Sharded backtests.** `run --shards N` gives metrics identical to an
-  unsharded run. Fine-tune recipes are backtested unsharded on the sample.
-
-### Fine-tune once, forecast many times
-
-After the backtest shows the recipe works (a config with `fine_tune:` is
-retrained per fold in `run`), train it once on all history and save it:
-
-```bash
-python -m forecast_fm finetune configs/05_chronos2_lora.yaml            # -> models/chronos2-lora-<date>/
-python -m forecast_fm forecast models/chronos2-lora-<date>/forecast_config.yaml   # every day/week
-```
-
-The output directory holds the weights (`finetuned-ckpt/`), a provenance
-manifest (`forecast_fm_model.json`: base model, recipe, training window,
-data fingerprint, code commit, environment) and a ready `forecast_config.yaml`.
-Existing checkpoints are never overwritten unless you pass `--force`. Retrain on your own
-schedule with a new `--as-of`. Each `forecast` reports the checkpoint's age
-in days.
-
-**Before a long run, measure it.** `bench` times training steps and forecast
-throughput on your machine, then estimates the plan:
-
-```bash
-python -m forecast_fm bench configs/07_chronos2_lora_rounds.yaml --catalog 3000000 --memory-gb 24
-# prints: seconds/step, series/s, hours per fine-tune, backtest and production
-# forecast, and the --shards that fit the memory budget (numbers are your Mac's)
-```
-
-**Many SKUs, bounded memory: rounds.** `fine_tune.rounds: K` splits
-`num_steps` into K rounds. Each round draws `train_mix.max_series` new SKUs
-(disjoint from earlier rounds, with the same class mix) and loads only those.
-`finetune` profiles the whole catalog in one streaming pass first, so millions
-of SKUs never sit in memory. LoRA adapters are merged after each round; the
-learning rate steps down across rounds. Training loss per round is recorded in
-the manifest. Without a per-round cap, more than `max_pool_series` (200k) SKUs
-is refused rather than running out of memory.
-
-**Fixed-window training** (`fine_tune.train_window_days: 730`). By default a
-fine-tune learns from the whole history up to its cutoff, an expanding
-window, so a later fold trains on more years than an earlier one. With a fixed
-window, every fine-tune learns only from targets in the last W days before its
-cutoff (each with up to `context_length` days of real history before it, as at
-inference). Every fold's model and the production model then train on the same
-amount of recent data. Young SKUs still train from their first possible day.
-The window is recorded in the manifest. Pair it with `context_length`, which is
-the fixed window the model *reads* at forecast time.
-
-**What one training step is.** The trainer:
-1. picks `batch_size` variates' worth of SKUs (about 8 SKUs at 8 variates),
-   uniformly from the round's pool;
-2. cuts each SKU's history at a random day: up to `context_length` days before
-   it are the input (target, past covariates, known covariates), and the next 90
-   days are the answer, with the known covariates' actual values for those days;
-3. runs Chronos-2 on the batch (16-day patches, attention across time and across
-   the SKU's variates) and predicts 21 quantiles for each of the 90 days;
-4. scores them with quantile (pinball) loss against the real 90 days;
-5. backpropagates, and AdamW updates the LoRA adapter (or all weights in `full`).
-
-So 50,000 steps ≈ 400,000 SKU windows; the time is steps × seconds per step.
-
-**Choosing the training series** (`fine_tune.train_mix`). The trainer draws
-series uniformly, so the class mix of the training set is the mix the model
-learns. When most of the catalog is intermittent, set the mix explicitly:
-
-```yaml
-fine_tune:
-  mode: lora
-  train_mix:
-    classes: [BAU, seasonal, promo, event, intermittent]  # may train (default: all)
-    max_share: {intermittent: 0.25}   # cap a class's share of the training series
-    min_nonzero_days: 4               # drop near-dead series ...
-    lookback_days: 365                # ... over the last year before the cutoff
-    max_series: 50000                 # cap the total, keeping the shares
-    seed: 42
-```
-
-Only training is affected: every series is still forecast and scored. The
-selection uses data up to each fold's cutoff only. The realized mix is recorded
-in the run stats and the `finetune` manifest. `configs/06a-c` are the
-continuous-only / natural-mix / capped-intermittent study.
-
-A saved checkpoint refuses to forecast from any date before its `train_end`,
-so it can never be backtested on data it has already seen. To measure a
-recipe's accuracy, use `run` with `fine_tune:` in the config.
-
-### Try it on synthetic data
-
-```bash
-python examples/make_demo_data.py
-python -m forecast_fm -p examples/demo_project.yaml audit
-python -m forecast_fm -p examples/demo_project.yaml run configs/01_seasonal_naive.yaml --no-commit
-python -m forecast_fm -p examples/demo_project.yaml run configs/03_chronos2_zero_shot.yaml --no-commit
-```
+- `device: auto` picks CUDA, then MPS, then CPU. `PYTORCH_ENABLE_MPS_FALLBACK=1`
+  is set automatically, so an op MPS lacks falls back to CPU instead of failing.
+- `dtype: bfloat16` on MPS needs macOS 14+. Keep `float32` until a parity check
+  on the sample shows bf16 matches it.
+- Long runs: `caffeinate -i python -m forecast_fm run ...` stops the Mac
+  sleeping mid-backtest.
+- Unified memory is shared by the data and the model. A 30k-series sample fits
+  easily in 32 GB; the full catalog does not fit as one table, so the full run
+  is sharded (`--shards`, sized by `bench`).
 
 ## Layout
 
 | path | what |
 |---|---|
-| `forecast_fm/data.py` | load raw data, build the daily grid with vectorized index arithmetic, demand classes |
-| `forecast_fm/sample.py` | streaming stratified sampler (WP2) |
-| `forecast_fm/folds.py` | fold cutoffs (validation + holdout, no overlap) |
+| `forecast_fm/cli.py` | the commands |
+| `forecast_fm/config.py` | `project.yaml` and experiment configs: sections, profiles, overrides, validation |
+| `forecast_fm/data.py` | load raw data, build the daily grid, demand classes, streaming and sharding |
+| `forecast_fm/sample.py` | streaming stratified sampler |
+| `forecast_fm/folds.py` | retrain dates (fold cutoffs), forecast origins, holdout |
 | `forecast_fm/plans.py` | horizon covariates by policy: `plan` / `actual` / `carry_forward`; plan snapshots via `as_of` |
 | `forecast_fm/backtest.py` | rolling-origin harness; the model never receives post-cutoff targets |
-| `forecast_fm/metrics.py` | WAPE, bias, MASE, wQL, quantile coverage by fold / horizon bucket / demand class |
-| `forecast_fm/models/` | `naive`, `seasonal_naive`, `croston`, `chronos2` |
-| `forecast_fm/device.py` | CUDA / MPS / CPU and dtype selection |
-| `forecast_fm/train_mix.py` | which series a fine-tune trains on (class filter, share caps, activity) |
+| `forecast_fm/metrics.py` | WAPE, bias, MASE, wQL, quantile coverage by fold / horizon bucket / class / model age |
+| `forecast_fm/models/` | `naive`, `seasonal_naive`, `croston`, `chronos2` (zero-shot, fine-tuning, fixed window) |
+| `forecast_fm/train_mix.py` | which series a fine-tune trains on: class filter, share caps, activity, rounds |
 | `forecast_fm/cold_start.py` | new / short-history series: launch profiles from analogs |
 | `forecast_fm/runner.py` | sharded backtest and forecast orchestration (the long daily file) |
 | `forecast_fm/finetune.py` | production fine-tuning: a saved checkpoint + manifest + forecast config |
+| `forecast_fm/bench.py` | time training and forecasting; estimate the full plan |
 | `forecast_fm/ledger.py` | append-only `experiments/`, verdicts vs `based_on` |
+| `forecast_fm/device.py` | CUDA / MPS / CPU and dtype selection |
 | `configs/` | experiment configs (one hypothesis each) |
+| `examples/` | synthetic demo data generator and its project file |
 | `project.yaml` | the fixed project policy (columns marked TODO) |

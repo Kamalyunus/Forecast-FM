@@ -133,13 +133,12 @@ def test_run_checks_git_before_backtest_and_records_invocation(tmp_path, monkeyp
     (tmp_path / "proj.yaml").write_text(yaml.safe_dump(d))
     (tmp_path / "e.yaml").write_text(yaml.safe_dump({"name": "sn", "hypothesis": "h",
                                                      "model": "seasonal_naive"}))
-    called = []
+    called, real = [], runner.backtest
     monkeypatch.setattr(runner, "backtest", lambda *a, **k: called.append(1))
     with pytest.raises(RuntimeError, match="uncommitted"):  # proj.yaml untracked = dirty
         main(["-p", "proj.yaml", "run", "e.yaml"])
     assert not called  # refused before any compute
-    monkeypatch.undo()
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runner, "backtest", real)
     subprocess.run(["git", "add", "."], check=True)
     subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"], check=True)
     main(["-p", "proj.yaml", "--set", "season_length=14", "run", "e.yaml"])

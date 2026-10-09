@@ -70,6 +70,23 @@ def load_metrics(exp_id: str) -> dict:
     return json.loads(matches[0].read_text())
 
 
+def has_experiment(exp_id: str) -> bool:
+    return any(EXP_DIR.glob(f"{exp_id}*/metrics.json"))
+
+
+def check_reference(exp: ExperimentConfig, commit: bool) -> None:
+    """Called BEFORE a backtest: a ledgered run needs its `based_on` run in
+    the ledger, or the verdict would fail after hours of compute. A debug run
+    only warns and gets no verdict."""
+    if not exp.based_on or has_experiment(exp.based_on):
+        return
+    msg = (f"based_on {exp.based_on!r} is not in {EXP_DIR}/ (python -m forecast_fm leaderboard lists "
+           f"the ids): run the reference experiment first, or set based_on: null")
+    if commit:
+        raise ValueError(msg)
+    print(f"[run] note: {msg}; this debug run gets no verdict")
+
+
 def verdict(metrics: dict, ref: dict | None, project: ProjectConfig) -> tuple[str, float | None]:
     """improved / regressed need the overall change beyond the threshold AND
     a majority of folds moving the same way; anything else is inconclusive."""
@@ -114,7 +131,7 @@ def record(exp: ExperimentConfig, project: ProjectConfig, result: dict, commit: 
         out = Path(project.reports_dir) / "scratch" / re.sub(r"[^a-z0-9]+", "-", exp.name.lower())
     out.mkdir(parents=True, exist_ok=True)
 
-    ref = load_metrics(exp.based_on) if exp.based_on else None
+    ref = load_metrics(exp.based_on) if exp.based_on and (commit or has_experiment(exp.based_on)) else None
     tables = {k: t.to_dict(orient="records") for k, t in result["tables"].items()}
     signature = eval_signature(project, context.get("cutoffs") or result.get("cutoffs") or [])
     v, rel = verdict({"overall": result["overall"], "tables": tables, "eval_signature": signature},

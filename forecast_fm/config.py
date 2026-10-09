@@ -335,11 +335,45 @@ def interpolate_env(value):
     return value
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """PyYAML silently keeps the last of two identical keys; in a config that
+    hides a pasted-in block that overrides earlier settings."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = {}
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ValueError(f"duplicate key {key!r} on lines {seen[key]} and "
+                                 f"{key_node.start_mark.line + 1}: YAML would keep the last one")
+            seen[key] = key_node.start_mark.line + 1
+        return super().construct_mapping(node, deep)
+
+
+def read_yaml(path: str | Path) -> dict:
+    """A config file as a dict: missing file, syntax errors and duplicate
+    keys are reported with the file name."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"config file {path} not found")
+    try:
+        d = yaml.load(path.read_text(), Loader=_StrictLoader)
+    except ValueError as e:
+        raise ValueError(f"{path}: {e}") from None
+    except yaml.YAMLError as e:
+        raise ValueError(f"{path}: not valid YAML: {e}") from None
+    if d is None:
+        return {}
+    if not isinstance(d, dict):
+        raise ValueError(f"{path}: expected a mapping of settings, got {type(d).__name__}")
+    return d
+
+
 def _read_layers(path: Path, seen: tuple = ()) -> dict:
     path = path.resolve()
     if path in seen:
         raise ValueError(f"extends cycle: {' -> '.join(str(p) for p in (*seen, path))}")
-    d = yaml.safe_load(path.read_text()) or {}
+    d = read_yaml(path)
     parent = d.pop("extends", None)
     profiles = d.pop("profiles", {}) or {}
     d = flatten_sections(d)
@@ -404,5 +438,8 @@ def load_project(path: str | Path = "project.yaml", profile: str | None = None,
 
 
 def load_experiment(path: str | Path) -> ExperimentConfig:
-    d = interpolate_env(yaml.safe_load(Path(path).read_text()) or {})
+    d = interpolate_env(read_yaml(path))
+    missing = [k for k in ("name", "hypothesis", "model") if k not in d]
+    if missing:
+        raise ValueError(f"{path}: an experiment config needs {missing} (see configs/01_seasonal_naive.yaml)")
     return _from_dict(ExperimentConfig, d, str(path))
