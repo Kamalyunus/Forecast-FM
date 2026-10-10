@@ -26,7 +26,7 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 
 ## 2. What exists (✅)
 
-`pytest`: 145 tests (130 run without torch; 15 need the tiny real Chronos-2).
+Core tests run without torch; real-library tests use a tiny random Chronos-2.
 
 - ✅ **Data** (`data.py`):
   - The daily grid is built by index arithmetic (series offset + days since the series starts): no per-series loops and no merge.
@@ -104,6 +104,12 @@ Status legend: ✅ done · 🟡 partly done · 🔲 to do · ❓ blocked on the 
 - ✅ **`bench`**: seconds per training step, forecast series/s and memory, measured on the machine; estimates hours per fine-tune, backtest and production forecast, and the shard count for a memory budget.
 - ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, bench, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
+- ✅ **Evaluation and forecast integrity** (`tests/test_integrity.py`): custom
+  holdouts constrain generated cutoffs and every origin; incomplete predictions
+  cannot win a verdict; empty scoring populations produce null metrics; sales
+  and plan contents are fingerprinted before a run; forecast resume verifies
+  settings, input contents, and local checkpoints, with a full restart required
+  on mismatch and forced restarts excluded while shard workers are active.
 
 ## 3. Invariants
 

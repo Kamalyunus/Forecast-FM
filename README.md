@@ -119,6 +119,19 @@ uncommitted changes, so every result is reproducible. The verdict is
 or `incomparable` (different data, policy, horizon or cutoffs than the
 reference). `experiments/` is append-only.
 
+Runs fingerprint the contents of sales files and plan snapshots before
+computing forecasts, and save those SHA-256 fingerprints in `metrics.json`.
+Changing a file in place makes the next run incomparable with the old one.
+This adds one streaming read of the inputs per invocation; keep the input
+files stable for the duration of the run. References recorded before content
+fingerprinting need to be rerun for a comparable verdict.
+
+Missing or non-finite predictions are counted in every slice. A run with
+any missing predictions, no scorable rows, or an incomplete reference gets
+an `inconclusive` verdict. Empty scoring populations produce null metrics.
+Custom holdout dates constrain both automatic validation cutoffs and every
+forecast origin, including the default single origin per fold.
+
 **Fine-tuned recipes are measured the same way:** a config with `fine_tune:`
 is retrained inside every fold. Measure the time first:
 
@@ -175,6 +188,16 @@ Shards stream only their own rows, finished parts are skipped on rerun
 (`--force` redoes them), and `shard_by: [category]` keeps a category in one
 shard so cross-learning and launch profiles see the whole group. `run --shards N`
 gives metrics identical to an unsharded backtest.
+
+Resuming also requires identical model settings, horizon, quantiles, code,
+environment, and input contents (including plans, upcoming SKUs, and local
+checkpoint files). A mismatch stops before reusing any parts. Choose a new
+`--out` or use `--force` **without `--shard`** to restart the whole directory.
+Forecast directories created before these identity checks also require a
+fresh output or full forced restart. A forced restart refuses to run while
+other workers are using the directory. For reproducible remote model weights,
+use a downloaded local checkpoint; a remote model ID alone does not version
+the contents hosted under that ID.
 
 ## 6. Configuring `project.yaml`
 

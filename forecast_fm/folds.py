@@ -32,22 +32,26 @@ def fold_cutoffs(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig
                              f"last date {last.date()}")
         if not holdout and (project.holdout_cutoffs or project.holdout_folds):
             # explicit or rule-based, the holdout window is off limits to validation
-            try:
-                first_hold = min(fold_cutoffs(first, last, project, holdout=True))
-            except ValueError:
-                first_hold = None  # no holdout fits the history: nothing to protect
-            if first_hold is not None and max(cutoffs) + pd.Timedelta(days=project.horizon) > first_hold:
+            first_hold = min(fold_cutoffs(first, last, project, holdout=True))
+            if max(cutoffs) + pd.Timedelta(days=project.horizon) > first_hold:
                 raise ValueError(f"validation cutoff {max(cutoffs).date()} + horizon overlaps the holdout "
                                  f"window starting {first_hold.date()}: move it earlier, or set "
                                  "holdout_cutoffs explicitly")
         return cutoffs
-    if holdout:
-        idx = range(project.holdout_folds)
+    if not holdout and project.holdout_cutoffs:
+        # Anchor automatic validation to the actual holdout, not to an
+        # unrelated window counted backwards from the end of the dataset.
+        boundary = min(fold_cutoffs(first, last, project, holdout=True))
+        cutoffs = [boundary - pd.Timedelta(days=project.horizon + i * project.fold_step)
+                   for i in range(project.n_folds)]
     else:
-        gap = -(-project.horizon // project.fold_step)
-        start = project.holdout_folds - 1 + gap if project.holdout_folds else 0
-        idx = range(start, start + project.n_folds)
-    cutoffs = [last - pd.Timedelta(days=project.horizon + i * project.fold_step) for i in idx]
+        if holdout:
+            idx = range(project.holdout_folds)
+        else:
+            gap = -(-project.horizon // project.fold_step)
+            start = project.holdout_folds - 1 + gap if project.holdout_folds else 0
+            idx = range(start, start + project.n_folds)
+        cutoffs = [last - pd.Timedelta(days=project.horizon + i * project.fold_step) for i in idx]
     earliest = first + pd.Timedelta(days=project.min_train_periods)
     kept = sorted(c for c in cutoffs if c >= earliest)
     if len(kept) < len(cutoffs):
@@ -64,10 +68,7 @@ def origin_limit(first: pd.Timestamp, last: pd.Timestamp, project: ProjectConfig
     """The date no validation forecast window may pass: the first holdout
     cutoff (validation never scores the holdout period), else the last date."""
     if project.holdout_cutoffs or project.holdout_folds:
-        try:
-            return min(fold_cutoffs(first, last, project, holdout=True))
-        except ValueError:
-            pass
+        return min(fold_cutoffs(first, last, project, holdout=True))
     return pd.Timestamp(last)
 
 
@@ -81,6 +82,9 @@ def fold_origins(cutoffs: list[pd.Timestamp], project: ProjectConfig,
     H = pd.Timedelta(days=project.horizon)
     out = []
     for i, c in enumerate(cutoffs):
+        if c + H > limit:
+            raise ValueError(f"fold cutoff {c.date()} + horizon passes {limit.date()}, the first holdout "
+                             "cutoff: validation may not score the holdout window")
         if not step:
             out.append([c])
             continue

@@ -104,8 +104,10 @@ def test_run_ledgers_and_verdict(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_AUTHOR_EMAIL", "t@t")
     monkeypatch.setenv("GIT_COMMITTER_NAME", "t")
     monkeypatch.setenv("GIT_COMMITTER_EMAIL", "t@t")
-    p = make_project()
-    panel = panel_from(make_raw(), p)
+    raw = make_raw()
+    raw.to_csv("sales.csv", index=False)
+    p = make_project(data_path="sales.csv")
+    panel = panel_from(raw, p)
     for model, based_on in (("naive", None), ("seasonal_naive", "exp001")):
         exp = ExperimentConfig(name=model, hypothesis=f"{model} test", model=model, based_on=based_on)
         preds, _ = backtest(panel, p, exp)

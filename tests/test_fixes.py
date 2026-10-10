@@ -102,17 +102,20 @@ def test_duplicate_plan_rows(tmp_path):
 
 # 6. ledger ---------------------------------------------------------------------------------------------
 
-def test_verdict_refuses_incomparable_runs():
+def test_verdict_refuses_incomparable_runs(tmp_path):
     from forecast_fm.ledger import eval_signature, verdict
 
-    p = make_project()
+    data = str(tmp_path / "sales.csv")
+    make_raw().to_csv(data, index=False)
+    p = make_project(data_path=data)
     cut = [pd.Timestamp("2024-05-01")]
     ref = {"overall": {"wape": 1.0}, "tables": {"fold": [{"fold": 0, "wape": 1.0}]},
            "eval_signature": eval_signature(p, cut)}
     new = {"overall": {"wape": 0.5}, "tables": {"fold": [{"fold": 0, "wape": 0.5}]},
-           "eval_signature": eval_signature(make_project(horizon=7, horizon_buckets=[7]), cut)}
+           "eval_signature": eval_signature(
+               make_project(data_path=data, horizon=7, horizon_buckets=[7]), cut)}
     assert verdict(new, ref, p)[0] == "incomparable"
-    new["eval_signature"] = eval_signature(make_project(model_defaults={"x": {}}), cut)
+    new["eval_signature"] = eval_signature(make_project(data_path=data, model_defaults={"x": {}}), cut)
     assert verdict(new, ref, p)[0] == "improved"  # model settings are what experiments change
 
 
@@ -152,7 +155,9 @@ def test_record_survives_missing_primary_metric(tmp_path, monkeypatch):
 
     monkeypatch.chdir(tmp_path)
     res = {"overall": {"wape": None}, "tables": {"fold": pd.DataFrame({"fold": [0], "wape": [None]})}}
-    record(ExperimentConfig(name="x", hypothesis="h", model="naive"), make_project(), res, commit=False)
+    make_raw().to_csv("sales.csv", index=False)
+    record(ExperimentConfig(name="x", hypothesis="h", model="naive"),
+           make_project(data_path="sales.csv"), res, commit=False)
 
 
 # 7. fine-tune sees full history -------------------------------------------------------------------

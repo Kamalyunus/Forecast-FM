@@ -9,6 +9,7 @@ as `expNNN [verdict] <hypothesis>`. Debug runs (`--no-commit`) write to
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 from dataclasses import asdict
@@ -18,6 +19,7 @@ import pandas as pd
 import yaml
 
 from .config import ExperimentConfig, ProjectConfig
+from .provenance import input_snapshot
 
 EXP_DIR = Path("experiments")
 LEDGER = EXP_DIR / "LEDGER.md"
@@ -67,7 +69,7 @@ _NOT_EVAL = {"name", "model_defaults", "reports_dir", "models_dir", "success_cri
 
 
 def eval_signature(project: ProjectConfig, cutoffs: list, origins: list | None = None,
-                   data=None) -> str:
+                   data=None, input_fingerprints: dict | None = None) -> str:
     """Two runs are comparable only if data, filters, covariate policy,
     horizon, quantiles, cutoffs and forecast origins are identical. `data`:
     a --data override of the project's data_path; `origins`: per-fold
@@ -75,6 +77,8 @@ def eval_signature(project: ProjectConfig, cutoffs: list, origins: list | None =
     import hashlib
 
     d = {k: v for k, v in project.to_dict().items() if k not in _NOT_EVAL}
+    d["_input_fingerprints"] = (input_fingerprints if input_fingerprints is not None
+                                else input_snapshot(project, data).fingerprints)
     d["_cutoffs"] = [str(pd.Timestamp(c).date()) for c in cutoffs]
     if origins:
         d["_origins"] = [[str(pd.Timestamp(o).date()) for o in fold] for fold in origins]
@@ -146,21 +150,27 @@ def check_reference(exp: ExperimentConfig, commit: bool) -> None:
 def verdict(metrics: dict, ref: dict | None, project: ProjectConfig) -> tuple[str, float | None]:
     """improved / regressed need the overall change beyond the threshold AND
     a majority of folds moving the same way; anything else is inconclusive."""
+    if metrics["overall"].get("n_missing_pred", 0) or metrics["overall"].get("n") == 0:
+        return "inconclusive", None
     if ref is None:
         return "reference", None
-    if ref.get("eval_signature") and metrics.get("eval_signature") \
-            and ref["eval_signature"] != metrics["eval_signature"]:
+    if ref["overall"].get("n_missing_pred", 0) or ref["overall"].get("n") == 0:
+        return "inconclusive", None
+    if metrics["overall"].get("n") != ref["overall"].get("n"):
+        return "incomparable", None
+    if ref.get("eval_signature") != metrics.get("eval_signature"):
         return "incomparable", None  # different data, policy, horizon or cutoffs
     m = project.primary_metric
     new, old = metrics["overall"].get(m), ref["overall"].get(m)
-    if new is None or not old:
+    if new is None or not old or not math.isfinite(new) or not math.isfinite(old):
         return "inconclusive", None
     rel = (new - old) / abs(old)
     folds_new = {f["fold"]: f[m] for f in metrics["tables"]["fold"]}
     folds_old = {f["fold"]: f[m] for f in ref["tables"]["fold"]}
     # a fold without a finite value on either side says nothing: it is not "worse"
     common = [k for k in folds_new if k in folds_old
-              and pd.notna(folds_new[k]) and pd.notna(folds_old[k])]
+              and pd.notna(folds_new[k]) and pd.notna(folds_old[k])
+              and math.isfinite(folds_new[k]) and math.isfinite(folds_old[k])]
     if not common:
         return "inconclusive", rel
     better = sum(folds_new[k] < folds_old[k] for k in common)
@@ -191,13 +201,18 @@ def record(exp: ExperimentConfig, project: ProjectConfig, result: dict, commit: 
 
     ref = load_metrics(exp.based_on) if exp.based_on and (commit or has_experiment(exp.based_on)) else None
     tables = {k: t.to_dict(orient="records") for k, t in result["tables"].items()}
+    fingerprints = result.get("input_fingerprints")
+    if fingerprints is None:
+        fingerprints = input_snapshot(project, context.get("data")).fingerprints
     signature = eval_signature(project, context.get("cutoffs") or result.get("cutoffs") or [],
-                               origins=result.get("origins"), data=context.get("data"))
+                               origins=result.get("origins"), data=context.get("data"),
+                               input_fingerprints=fingerprints)
     v, rel = verdict({"overall": result["overall"], "tables": tables, "eval_signature": signature},
                      ref, project)
     payload = {
         "id": exp_id, "verdict": v, "delta_rel": rel, "based_on": exp.based_on,
         "primary_metric": project.primary_metric, "code": state, "eval_signature": signature,
+        "input_fingerprints": fingerprints,
         "invocation": {k: v for k, v in context.items() if k != "cutoffs"},
         "cutoffs": [str(pd.Timestamp(c).date())
                     for c in (context.get("cutoffs") or result.get("cutoffs") or [])],
