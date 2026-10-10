@@ -58,7 +58,7 @@ Core tests run without torch; real-library tests use a tiny random Chronos-2.
 - ✅ **`cutoffs` command** and parquet plan loading (WP3).
 - ✅ **Ledger** (`ledger.py`):
   - `experiments/expNNN-*/` holds the config, metrics.json, and slice CSVs; `LEDGER.md` gets one row per run; git commits `expNNN [verdict] …`.
-  - Verdict rule: `improved` or `regressed` needs both a change larger than `verdict_threshold` and a majority of folds moving the same way. Anything else is `inconclusive`.
+  - Verdict rule: `improved` or `regressed` needs both a change larger than `verdict_threshold` and a majority of folds moving the same way. Anything else is `inconclusive`, as is a run (or reference) with more than `max_missing_share` of its scorable rows unforecast, or whose input files changed while it ran.
   - A ledgered run refuses to start when the code has uncommitted changes. `--no-commit` writes to `reports/scratch/`.
 - ✅ **Production fine-tuning** (`finetune.py`, `python -m forecast_fm finetune <config>`):
   - Trains once on history <= `--as-of` (default: the last date).
@@ -105,8 +105,8 @@ Core tests run without torch; real-library tests use a tiny random Chronos-2.
 - ✅ **CLI**: `env, models, config, audit, sample, cutoffs, run, leaderboard, bench, finetune, forecast`.
 - ✅ **CI**: ubuntu core job without torch, plus a macos-14 (arm64) job with torch and chronos.
 - ✅ **Evaluation and forecast integrity** (`tests/test_integrity.py`): custom
-  holdouts constrain generated cutoffs and every origin; incomplete predictions
-  cannot win a verdict; empty scoring populations produce null metrics; sales
+  holdouts constrain generated cutoffs and every origin; runs with more than
+  `max_missing_share` of their rows unforecast, or whose inputs changed mid-run, get no verdict; empty scoring populations produce null metrics; sales
   and plan contents are fingerprinted before a run; forecast resume verifies
   settings, input contents, and local checkpoints, with a full restart required
   on mismatch and forced restarts excluded while shard workers are active.

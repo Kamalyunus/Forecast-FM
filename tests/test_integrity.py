@@ -114,11 +114,22 @@ def test_missing_only_shard_combines_exactly():
         pd.testing.assert_frame_equal(one["tables"][name], combined["tables"][name])
 
 
-def test_different_scoring_population_cannot_win():
+def test_missing_forecasts_are_tolerated_up_to_max_missing_share():
+    """Routine gaps (a new SKU without analogs) must not neuter the ledger; a run
+    that skips many rows must not win. The population otherwise matches, since
+    the signature already pins data, cutoffs and origins."""
     p = ProjectConfig(horizon=2, horizon_buckets=[2])
-    full = _payload(metrics.score(_predictions(), p))
-    subset = _payload(metrics.score(_predictions().iloc[:2], p))
-    assert verdict(subset, full, p) == ("incomparable", None)
+    ref = _payload(metrics.score(_predictions(), p))
+    rows = pd.concat([_predictions()] * 50, ignore_index=True)  # 300 rows
+    rows.loc[0, "y_pred"] = np.nan                                 # 1 of 300 missing: 0.3%
+    small_gap = _payload(metrics.score(rows.assign(y_pred=rows["y_pred"] * 0.5), p))
+    assert verdict(small_gap, ref, p)[0] in ("improved", "regressed", "inconclusive")
+    assert verdict(small_gap, ref, p)[0] != "incomparable"
+    strict = ProjectConfig(horizon=2, horizon_buckets=[2], max_missing_share=0.0)
+    assert verdict(small_gap, ref, strict) == ("inconclusive", None)
+    half = _payload(metrics.score(_predictions().assign(y_pred=[10., np.nan] * 3), p))
+    assert verdict(half, ref, p) == ("inconclusive", None)
+    assert verdict(ref, half, p) == ("inconclusive", None)
 
 
 @pytest.fixture
@@ -185,8 +196,11 @@ def test_backtest_captures_inputs_before_compute_and_rejects_changes(project, mo
         return result
 
     monkeypatch.setattr(runner, "backtest", changing)
-    with pytest.raises(ValueError, match="input changed during run"):
-        runner.run_backtest(project, make_exp())
+    with pytest.warns(UserWarning, match="changed during the run"):
+        result, _ = runner.run_backtest(project, make_exp())
+    assert result["inputs_changed"] == ["sales"]  # the hours of compute are kept ...
+    payload = {"overall": result["overall"], "tables": {}, "inputs_changed": result["inputs_changed"]}
+    assert verdict(payload, None, project) == ("inconclusive", None)  # ... but never become a verdict
 
 
 def test_ledger_retains_the_inputs_used_by_backtest(project, tmp_path):

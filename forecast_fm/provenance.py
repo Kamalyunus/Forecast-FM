@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from typing import NamedTuple
 
 from .config import ProjectConfig
 from .data import _expand
@@ -32,9 +33,19 @@ def _files(source) -> list[Path]:
     return out
 
 
-def _stamp(path: Path) -> tuple:
+class _Stamp(NamedTuple):
+    """Inode, size and modification time: what changes when a file's bytes are
+    replaced. Not ctime, which a chmod, chown or backup tool moves without
+    touching the content."""
+
+    ino: int
+    size: int
+    mtime_ns: int
+
+
+def _stamp(path: Path) -> _Stamp:
     s = path.stat()
-    return s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
+    return _Stamp(s.st_ino, s.st_size, s.st_mtime_ns)
 
 
 class InputSnapshot:
@@ -54,19 +65,29 @@ class InputSnapshot:
                         h.update(chunk)
                 if _stamp(path) != before:
                     raise ValueError(f"input changed while fingerprinting: {path}; retry with stable inputs")
-                entries.append({"path": str(path), "size": before[2], "sha256": h.hexdigest()})
+                entries.append({"path": str(path), "size": before.size, "sha256": h.hexdigest()})
                 stamps.append((str(path), before))
             self.fingerprints[name] = entries
             self._stamps[name] = stamps
 
-    def check(self) -> None:
+    def changed(self) -> list[str]:
+        """Names of the inputs whose files changed since the snapshot."""
+        out = []
         for name, source in self.sources.items():
             try:
                 current = [(str(p), _stamp(p)) for p in _files(source)]
-            except (OSError, ValueError) as e:
-                raise ValueError(f"input changed during run: {name}; retry with stable inputs") from e
+            except (OSError, ValueError):
+                out.append(name)
+                continue
             if current != self._stamps[name]:
-                raise ValueError(f"input changed during run: {name}; retry with stable inputs")
+                out.append(name)
+        return out
+
+    def check(self) -> None:
+        """Raise if any input changed: for a result about to be published."""
+        changed = self.changed()
+        if changed:
+            raise ValueError(f"input changed during run: {', '.join(changed)}; retry with stable inputs")
 
 
 def input_snapshot(project: ProjectConfig, data=None, *, production: bool = False,

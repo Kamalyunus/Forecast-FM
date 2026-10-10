@@ -285,3 +285,20 @@ def test_chronos2_stale_context_is_a_missing_forecast(monkeypatch, tmp_path):
     assert out.loc[out[SERIES].astype(str) == "S1", "y_pred"].isna().all()
     assert out.loc[out[SERIES].astype(str) != "S1", "y_pred"].notna().all()
     assert m.stats["n_no_context"] == 1
+
+
+def test_input_stamp_ignores_metadata_only_changes(tmp_path):
+    """A chmod or a backup tool touching ctime must not void hours of backtest."""
+    import os
+
+    from forecast_fm.provenance import InputSnapshot
+
+    f = tmp_path / "sales.parquet"
+    f.write_bytes(b"x" * 100)
+    snap = InputSnapshot({"sales": str(f)})
+    os.chmod(f, 0o600)
+    assert snap.changed() == []
+    f.write_bytes(b"y" * 100)  # same size, new bytes: mtime moves
+    assert snap.changed() == ["sales"]
+    with pytest.raises(ValueError, match="input changed during run: sales"):
+        snap.check()

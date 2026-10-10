@@ -124,6 +124,9 @@ evaluation:
   service_level: 0.95            # TODO: your decision quantile (added to quantiles)
   primary_metric: wape           # wape | mase | wql
   verdict_threshold: 0.01
+  # a run (or its reference) with more than this share of scorable rows lacking a
+  # forecast (new SKUs without analogs, discontinued SKUs) gets no verdict
+  max_missing_share: 0.01
   slice_cols: [category]         # statics to break metrics down by
   success_criteria: {}
 

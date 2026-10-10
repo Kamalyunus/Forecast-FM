@@ -128,6 +128,7 @@ class ProjectConfig:
     service_level: float | None = None         # decision quantile; added to quantiles
     primary_metric: str = "wape"
     verdict_threshold: float = 0.01            # relative change below which a verdict is inconclusive
+    max_missing_share: float = 0.01            # share of scorable rows without a forecast a verdict tolerates
     slice_cols: list[str] = field(default_factory=list)  # statics to break metrics down by
     success_criteria: dict = field(default_factory=dict)
 
@@ -232,6 +233,8 @@ class ProjectConfig:
                 _check_date(d, name, errors)
         if not 0 < self.min_plan_coverage <= 1:
             errors.append("min_plan_coverage must be in (0, 1]")
+        if not 0 <= self.max_missing_share < 1:
+            errors.append("max_missing_share must be in [0, 1)")
 
         qs = list(self.quantiles)
         if self.service_level is not None:

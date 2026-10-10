@@ -126,9 +126,11 @@ This adds one streaming read of the inputs per invocation; keep the input
 files stable for the duration of the run. References recorded before content
 fingerprinting need to be rerun for a comparable verdict.
 
-Missing or non-finite predictions are counted in every slice. A run with
-any missing predictions, no scorable rows, or an incomplete reference gets
-an `inconclusive` verdict. Empty scoring populations produce null metrics.
+Missing or non-finite predictions are counted in every slice. A run, or its
+reference, with more than `max_missing_share` (default 1%) of its scorable
+rows lacking a forecast gets an `inconclusive` verdict, as does a run whose
+input files changed while it ran (the result is kept and marked, not thrown
+away). Empty scoring populations produce null metrics.
 Custom holdout dates constrain both automatic validation cutoffs and every
 forecast origin, including the default single origin per fold.
 

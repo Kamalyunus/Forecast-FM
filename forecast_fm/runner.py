@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -91,11 +92,16 @@ def run_backtest(project: ProjectConfig, exp: ExperimentConfig, data=None, shard
             print(f"[shard {i + 1}/{shards}] done in {time.perf_counter() - t0:.0f}s")
     if not parts:
         raise ValueError("no series in any shard")
-    inputs.check()
+    # an input that changed under a running backtest makes the result
+    # untrustworthy, not worthless: keep it, mark it, and let the verdict refuse
+    changed = inputs.changed()
+    if changed:
+        warnings.warn(f"input files changed during the run: {', '.join(changed)}; the result is kept "
+                      "but gets no verdict (inputs_changed in metrics.json)", stacklevel=2)
     result = metrics.result(metrics.combine(parts), project)
     result.update(stats=stats, env=describe(), cutoffs=cutoffs, shards=shards,
                   origins=[[str(o.date()) for o in fold] for fold in origins],
-                  input_fingerprints=inputs.fingerprints)
+                  input_fingerprints=inputs.fingerprints, inputs_changed=changed)
     return result, kept
 
 
