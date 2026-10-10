@@ -37,16 +37,19 @@ def _quantiles(preds: pd.DataFrame) -> list[float]:
 def prepare(preds: pd.DataFrame, project: ProjectConfig, classes: pd.Series | None = None,
             statics: pd.DataFrame | None = None) -> tuple[pd.DataFrame, int]:
     """(scorable rows with error columns, number of rows missing a forecast)."""
-    has_truth = preds["y_true"].notna() & ~preds[STOCKOUT].fillna(False).astype(bool)
-    missing = has_truth & preds["y_pred"].isna()
-    p = preds[has_truth & ~missing].copy()
+    has_truth = np.isfinite(preds["y_true"]) & ~preds[STOCKOUT].fillna(False).astype(bool)
+    missing = has_truth & ~np.isfinite(preds["y_pred"])
+    p = preds[has_truth].copy()
     y, f = p["y_true"].to_numpy(np.float64), p["y_pred"].to_numpy(np.float64)
-    p["_y"], p["_ae"], p["_e"] = y, np.abs(f - y), f - y
+    valid = np.isfinite(f)
+    p["_valid"], p["_missing"] = valid.astype(np.int64), (~valid).astype(np.int64)
+    p["_y"] = np.where(valid, y, 0.0)
+    p["_ae"], p["_e"] = np.where(valid, np.abs(f - y), 0.0), np.where(valid, f - y, 0.0)
     qs = _quantiles(p)
     if qs:
         # rows without quantiles (a point model's rows next to cold-start rows
         # that have them) must not count as zero loss / not covered
-        hq = p[[f"{Q_PREFIX}{q:g}" for q in qs]].notna().all(axis=1).to_numpy()
+        hq = valid & np.isfinite(p[[f"{Q_PREFIX}{q:g}" for q in qs]].to_numpy()).all(axis=1)
         p["_hq"], p["_y_q"] = hq.astype(np.float64), np.where(hq, y, 0.0)
         for q in qs:
             d = y - p[f"{Q_PREFIX}{q:g}"].to_numpy(np.float64)
@@ -89,14 +92,15 @@ def partial(p: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     and coverage per quantile, row count, and the MASE ratio sum/count over
     (fold, series)."""
     qs = _quantiles(p)
-    cols = ["_y", "_ae", "_e", *[f"_pl{q:g}" for q in qs], *[f"_cov{q:g}" for q in qs]]
+    cols = ["_y", "_ae", "_e", "_valid", "_missing",
+            *[f"_pl{q:g}" for q in qs], *[f"_cov{q:g}" for q in qs]]
     if qs:
         cols += ["_hq", "_y_q"]
     key = by or ["_all"]
     q = p.assign(_all="all") if not by else p
     sums = q.groupby(key, observed=True)[cols].sum()
-    sums["n"] = q.groupby(key, observed=True).size()
-    s = q[q["mase_scale"] > 0]
+    sums["n"] = sums.pop("_valid")
+    s = q[(q["mase_scale"] > 0) & (q["_valid"] > 0)]
     unit = ["fold", "origin", SERIES] if "origin" in q.columns else ["fold", SERIES]
     ser = s.groupby([*key, *unit], observed=True).agg(ae=("_ae", "mean"), sc=("mase_scale", "first"))
     ratio = (ser["ae"] / ser["sc"]).groupby(level=list(range(len(key))), observed=True)
@@ -108,9 +112,14 @@ def partial(p: pd.DataFrame, by: list[str]) -> pd.DataFrame:
 def finalize(parts: pd.DataFrame, by: list[str]) -> pd.DataFrame:
     key = by or ["_all"]
     sums = parts.groupby(key, observed=True).sum(numeric_only=True)
+    if not by and sums.empty:
+        # No eligible truth (or no rows): still produce a useful overall
+        # result with zero counts and undefined metrics.
+        sums = sums.reindex(["all"], fill_value=0)
     qs = sorted(float(c[3:]) for c in sums.columns if c.startswith("_pl"))
     out = pd.DataFrame(index=sums.index)
     out["n"] = sums["n"].astype(np.int64)
+    out["n_missing_pred"] = sums["_missing"].astype(np.int64)
     denom = sums["_y"].replace(0, np.nan)
     out["wape"] = sums["_ae"] / denom
     out["bias"] = sums["_e"] / denom
@@ -175,7 +184,7 @@ def _clean(d: dict) -> dict:
     out = {}
     for k, v in d.items():
         if isinstance(v, (np.floating, float)):
-            out[k] = None if np.isnan(v) else float(v)
+            out[k] = None if not np.isfinite(v) else float(v)
         elif isinstance(v, np.integer):
             out[k] = int(v)
         else:

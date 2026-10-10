@@ -158,13 +158,16 @@ def test_sample_floors_never_exceed_n():
 
 # --- ledger ---------------------------------------------------------------------------
 
-def test_signature_covers_data_override_and_origins_but_not_warning_thresholds():
-    p = _flat()
+def test_signature_covers_data_override_and_origins_but_not_warning_thresholds(tmp_path):
+    data, other = str(tmp_path / "sales.csv"), str(tmp_path / "other.csv")
+    make_raw().to_csv(data, index=False)
+    make_raw(seed=1).to_csv(other, index=False)
+    p = _flat(data_path=data)
     cut = [pd.Timestamp("2024-06-01")]
     base = eval_signature(p, cut)
-    assert eval_signature(p, cut, data="other.parquet") != base
+    assert eval_signature(p, cut, data=other) != base
     assert eval_signature(p, cut, origins=[[cut[0], cut[0] + pd.Timedelta(days=7)]]) != base
-    assert eval_signature(_flat(min_plan_coverage=0.5, plan_max_age_days=3), cut) == base
+    assert eval_signature(_flat(data_path=data, min_plan_coverage=0.5, plan_max_age_days=3), cut) == base
 
 
 def test_verdict_ignores_folds_without_a_finite_value():
